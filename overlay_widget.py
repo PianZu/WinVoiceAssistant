@@ -14,7 +14,7 @@ States:
     idle       - small pill, dim ambient pulse (may show a hotkey hint) -
                  hides itself shortly after, unless an action just fired
     active     - wake word / push-to-talk just engaged: instant vivid cyan
-                 pop with an "ANIMUS LISTENING" badge, no ramp-up
+                 pop with a "JARVIS LISTENING" badge, no ramp-up
     listening  - same cyan accent, waiting for the first words
     streaming  - pill widens to show the live interim transcript
     action     - an emerald confirmation badge (e.g. "[LAUNCHED ARC]") is
@@ -44,7 +44,7 @@ EMERALD_COLOR = QColor(0, 224, 122, 255)  # confirmation-badge green
 
 ACTION_BADGE_LIFETIME_MS = 1500
 IDLE_HIDE_DELAY_MS = 300
-ACTIVE_POP_HINT = "ANIMUS LISTENING"
+ACTIVE_POP_HINT = "JARVIS LISTENING"
 
 
 class PillState(Enum):

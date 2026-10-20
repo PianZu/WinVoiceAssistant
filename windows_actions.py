@@ -75,6 +75,12 @@ _APP_ALIASES = {
     "file explorer": "explorer",
     "explorer": "explorer",
     "files": "explorer",
+    "dateien": "explorer",
+    "rechner": "calc",
+    "taschenrechner": "calc",
+    "kamera": "camera",
+    "konsole": "terminal",
+    "notizblock": "notepad",
 }
 
 
@@ -100,13 +106,98 @@ def _open_browser(url: str) -> None:
 
 
 def resolve_app(name: str) -> str:
+    """Map a spoken app name to a handler key. Names with no dedicated
+    handler in open_app() are returned as-is (normalised) and end up in the
+    generic launcher, which looks them up on PATH / in the Start Menu /
+    among installed Store apps."""
     # Multi-word aliases ("visual studio code", "file explorer") are matched
     # by regex with \s+ between words, so whitespace can vary - collapse it
     # before the exact-string dict lookup.
     key = re.sub(r"\s+", " ", name.strip().lower())
-    if key not in _APP_ALIASES:
-        raise ActionError(f"Unknown app alias: {name!r}")
-    return _APP_ALIASES[key]
+    return _APP_ALIASES.get(key, key)
+
+
+_START_MENU_DIRS = [
+    Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    Path(os.environ.get("PROGRAMDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+]
+
+
+def _find_start_menu_shortcut(name: str) -> Optional[Path]:
+    """Best-matching .lnk in the user's + system Start Menu, or None.
+
+    Exact (case-insensitive) basename match wins; otherwise a shortcut whose
+    basename starts with the spoken name ("firefox" -> "Firefox.lnk" rather
+    than "Firefox Privater Modus.lnk"); otherwise one that merely contains
+    it. Uninstaller shortcuts are skipped - "open spotify" must never hit
+    "Uninstall Spotify.lnk".
+    """
+    needle = name.lower()
+    exact: list[Path] = []
+    prefix: list[Path] = []
+    contains: list[Path] = []
+    for root in _START_MENU_DIRS:
+        if not root.is_dir():
+            continue
+        for lnk in root.rglob("*.lnk"):
+            base = lnk.stem.lower()
+            if "uninstall" in base or "deinstall" in base:
+                continue
+            if base == needle:
+                exact.append(lnk)
+            elif base.startswith(needle):
+                prefix.append(lnk)
+            elif needle in base:
+                contains.append(lnk)
+    for bucket in (exact, prefix, contains):
+        if bucket:
+            # Shortest name = closest match within the bucket.
+            return min(bucket, key=lambda p: len(p.stem))
+    return None
+
+
+def _find_store_app_id(name: str) -> Optional[str]:
+    """AppUserModelID of an installed (Store/packaged) app whose Start Menu
+    name contains `name`, via PowerShell's Get-StartApps. ~1s, so only used
+    as the last resort."""
+    if DRY_RUN:
+        return None
+    script = (
+        "Get-StartApps | Where-Object { $_.Name -like '*" + name.replace("'", "''") + "*' } "
+        "| Sort-Object { $_.Name.Length } | Select-Object -First 1 -ExpandProperty AppID"
+    )
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=8, creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    app_id = out.stdout.strip()
+    return app_id or None
+
+
+def _launch_generic(name: str) -> str:
+    """Open an app that has no dedicated handler. Tries, in order: an
+    executable on PATH, a Start Menu shortcut, an installed Store app."""
+    pretty = name.title()
+
+    exe = shutil.which(name) or shutil.which(name.replace(" ", ""))
+    if exe:
+        _run([exe])
+        return f"Opening {pretty}"
+
+    lnk = _find_start_menu_shortcut(name)
+    if lnk is not None:
+        _run(str(lnk))  # os.startfile resolves the shortcut like a double-click
+        return f"Opening {lnk.stem}"
+
+    app_id = _find_store_app_id(name)
+    if app_id:
+        _run(["explorer.exe", f"shell:AppsFolder\\{app_id}"])
+        return f"Opening {pretty}"
+
+    raise ActionError(f"Couldn't find an app called {name!r}")
 
 
 def open_app(app_name: str) -> str:
@@ -173,7 +264,125 @@ def open_app(app_name: str) -> str:
         _run(["explorer.exe"])
         return "Opening File Explorer"
 
-    raise ActionError(f"No handler registered for resolved app: {resolved}")
+    # Anything else (spotify, firefox, discord, ...): no hand-written
+    # handler, look it up on the system instead.
+    return _launch_generic(resolved)
+
+
+# ---------------------------------------------------------------------------
+# Closing apps
+# ---------------------------------------------------------------------------
+
+# Process image names (without .exe) per resolved app key, for apps whose
+# process isn't simply called like the app. Anything not listed here is
+# matched generically: any running process whose name contains the spoken
+# word (spaces removed) - "steam" -> steam.exe + steamwebhelper.exe.
+_CLOSE_PROCESS_NAMES = {
+    "terminal": ["WindowsTerminal"],
+    "calc": ["CalculatorApp", "Calculator"],
+    "camera": ["WindowsCamera"],
+    "code": ["Code"],
+    "edge": ["msedge"],
+    "x": [],  # a tab, not a process - nothing sensible to close
+    "browser": [],
+}
+
+# Never touched by the generic matcher, no matter what was said: OS core
+# processes, plus our own interpreter.
+_PROTECTED_PROCESSES = {
+    "system", "registry", "smss", "csrss", "wininit", "winlogon", "services",
+    "lsass", "svchost", "dwm", "fontdrvhost", "sihost", "taskhostw", "ctfmon",
+    "runtimebroker", "startmenuexperiencehost", "shellexperiencehost",
+    "searchhost", "textinputhost", "audiodg", "spoolsv", "dllhost", "conhost",
+    "wmiprvse", "msmpeng", "securityhealthservice", "securityhealthsystray",
+    "explorer", "python", "pythonw",
+}
+
+_CLOSE_GRACE_S = 2.5
+
+
+def _running_image_names() -> set[str]:
+    """Lower-cased image names (without .exe) of all running processes."""
+    out = subprocess.run(
+        ["tasklist", "/FO", "CSV", "/NH"],
+        capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    names: set[str] = set()
+    for line in out.stdout.splitlines():
+        if not line.startswith('"'):
+            continue
+        image = line.split('","', 1)[0].strip('"')
+        names.add(re.sub(r"\.exe$", "", image, flags=re.IGNORECASE).lower())
+    return names
+
+
+def _taskkill(images: list[str], force: bool) -> None:
+    cmd = ["taskkill"] + (["/F"] if force else [])
+    for image in images:
+        cmd += ["/IM", f"{image}.exe"]
+    subprocess.run(cmd, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def _close_explorer_windows() -> str:
+    # explorer.exe is also the desktop/taskbar - killing it is never what
+    # "close file explorer" means. Close the folder windows via the shell's
+    # COM automation instead.
+    script = (
+        "$w = (New-Object -ComObject Shell.Application).Windows(); "
+        "$n = 0; foreach ($x in @($w)) { try { $x.Quit(); $n++ } catch {} }; $n"
+    )
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=8, creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    count = out.stdout.strip() or "0"
+    return f"Closed {count} Explorer window(s)" if count != "0" else "No Explorer windows open"
+
+
+def close_app(app_name: str) -> str:
+    """Close every running instance of a friendly-named application.
+
+    Asks politely first (plain taskkill sends WM_CLOSE, so apps get to save
+    state), then force-kills whatever is still alive after _CLOSE_GRACE_S -
+    needed for apps like Steam or Spotify that otherwise just minimise to
+    the tray instead of exiting.
+    """
+    resolved = resolve_app(app_name)
+
+    if resolved == "explorer":
+        if DRY_RUN:
+            print("[DRY_RUN] would close File Explorer windows")
+            return "Closing File Explorer"
+        return _close_explorer_windows()
+
+    running = _running_image_names()
+    if resolved in _CLOSE_PROCESS_NAMES:
+        wanted = [p.lower() for p in _CLOSE_PROCESS_NAMES[resolved] if p.lower() in running]
+        if not _CLOSE_PROCESS_NAMES[resolved]:
+            raise ActionError(f"Can't close {app_name!r} - it isn't an application")
+    else:
+        needle = resolved.replace(" ", "")
+        wanted = sorted(
+            name for name in running
+            if needle in name and name not in _PROTECTED_PROCESSES
+        )
+
+    if not wanted:
+        return f"{app_name.title()} isn't running"
+
+    if DRY_RUN:
+        print(f"[DRY_RUN] would close processes: {wanted}")
+        return f"Closing {app_name.title()}"
+
+    _taskkill(wanted, force=False)
+    deadline = time.time() + _CLOSE_GRACE_S
+    while time.time() < deadline:
+        time.sleep(0.25)
+        if not (set(wanted) & _running_image_names()):
+            return f"Closed {app_name.title()}"
+    survivors = sorted(set(wanted) & _running_image_names())
+    _taskkill(survivors, force=True)
+    return f"Closed {app_name.title()}"
 
 
 # ---------------------------------------------------------------------------

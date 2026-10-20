@@ -25,8 +25,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import queue
-from typing import Callable, Optional
+import re
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from typing import Callable, Optional, Union
+
+import time
 
 import numpy as np
 import sounddevice as sd
@@ -38,6 +44,71 @@ BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
 
 # on_transcript(text: str, is_final: bool, speech_final: bool, utterance_id: int)
 TranscriptCallback = Callable[[str, bool, bool, int], None]
+
+# YouTube-trained Whisper invents these constantly over music. Drop the
+# whole transcript if it's only this junk (a real command plus this is rare).
+_HALLUCINATION = re.compile(
+    r"^\s*(?:"
+    r"thanks for watching(?:\s+.*)?|"
+    r"don't forget to subscribe(?:\s+.*)?|"
+    r"like and subscribe|"
+    r"(?:oh,?\s+){3,}oh\.?|"
+    r"(?:yeah,?\s+){3,}yeah\.?|"
+    r"vielen dank fürs zuschauen(?:\s+.*)?|"
+    r"untertitel(?:ung)?(?:\s+.*)?"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_hallucination(text: str) -> bool:
+    return bool(text) and bool(_HALLUCINATION.match(text))
+
+
+def resolve_stt_language() -> str:
+    """BCP-47-ish short code for the speech backend. `de` or `en`."""
+    return (os.environ.get("STT_LANGUAGE") or "en").strip().lower() or "en"
+
+
+def resolve_whisper_model(language: Optional[str] = None) -> str:
+    """Local Whisper model name. `*.en` checkpoints only speak English, so a
+    German (or any non-English) language setting swaps them for the
+    multilingual checkpoint with the same size (`small.en` -> `small`)."""
+    language = resolve_stt_language() if language is None else language
+    model = (os.environ.get("WHISPER_MODEL") or "small.en").strip() or "small.en"
+    if language != "en" and model.endswith(".en"):
+        multilingual = model[: -len(".en")]
+        print(
+            f"[whisper] {model} is English-only; using {multilingual} "
+            f"because STT_LANGUAGE={language}"
+        )
+        return multilingual
+    return model
+
+
+def resolve_input_device(spec: Optional[str]) -> Optional[Union[int, str]]:
+    """Turn the MIC_DEVICE setting into something sounddevice accepts.
+
+    - unset / empty  -> None (Windows default recording device)
+    - an integer     -> that device index, as listed by `python -m sounddevice`
+    - any other text -> case-insensitive substring match against the names of
+                        all *input* devices; the first hit wins. Matching by
+                        name is preferred over a bare index because indices
+                        shift whenever a USB device is (un)plugged.
+    """
+    if not spec or not spec.strip():
+        return None
+    spec = spec.strip()
+    if spec.isdigit():
+        return int(spec)
+    needle = spec.lower()
+    for idx, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0 and needle in dev["name"].lower():
+            return idx
+    available = [d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0]
+    raise RuntimeError(
+        f"MIC_DEVICE={spec!r} matches no input device. Available inputs: {available}"
+    )
 
 
 class _MicSource:
@@ -55,7 +126,11 @@ class _MicSource:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, data)
 
     def start(self) -> None:
+        device = resolve_input_device(os.environ.get("MIC_DEVICE"))
+        if device is not None:
+            print(f"[voice_stream] using mic: {sd.query_devices(device)['name']}")
         self._stream = sd.RawInputStream(
+            device=device,
             samplerate=SAMPLE_RATE,
             blocksize=BLOCK_SIZE,
             channels=CHANNELS,
@@ -82,9 +157,10 @@ class DeepgramStreamer:
     async def run(self, on_transcript: TranscriptCallback) -> None:
         import websockets
 
+        language = resolve_stt_language()
         url = (
             "wss://api.deepgram.com/v1/listen"
-            "?model=nova-2&interim_results=true&endpointing=300"
+            f"?model=nova-2&language={language}&interim_results=true&endpointing=300"
             f"&encoding=linear16&sample_rate={SAMPLE_RATE}&channels={CHANNELS}"
         )
         headers = {"Authorization": f"Token {self._api_key}"}
@@ -145,17 +221,34 @@ class DeepgramStreamer:
 
 
 class FasterWhisperStreamer:
-    """Rolling-window local fallback. Emits interim results every WINDOW_S
-    seconds and a final result after SILENCE_S seconds of low RMS energy."""
+    """Local Whisper. One transcription when the user stops speaking.
 
-    WINDOW_S = 2.0
-    SILENCE_S = 1.0
-    SILENCE_RMS_THRESHOLD = 300  # int16 RMS
+    A rolling interim pass was slower than the utterance itself on this
+    CPU: the final result waited behind that first pass, so a short
+    command landed many seconds late. Commands now wait out a short
+    silence, then run Whisper exactly once.
+    """
 
-    def __init__(self, model_size: str = "small.en") -> None:
+    WINDOW_S = 1.0  # quiet audio kept so the start of a word isn't clipped
+    SILENCE_S = 0.3
+    SILENCE_RMS_THRESHOLD = 300  # int16 RMS, floor when the room is quiet
+    # Music used to hold an utterance open until this fired.
+    MAX_UTTERANCE_S = 3.5
+    SPEECH_HOLD_S = 0.12  # ignore single drum hits
+    AMBIENT_WINDOW_S = 1.5
+
+    def __init__(self, model_size: str = "small", language: str = "en") -> None:
         from faster_whisper import WhisperModel
 
-        self._model = WhisperModel(model_size, device="cpu", compute_type="int8")
+        self._model_size = model_size
+        threads = min(8, os.cpu_count() or 4)
+        self._language = language
+        print(f"[whisper] loading {model_size} language={language} (CPU int8, {threads} threads)")
+        self._model = WhisperModel(
+            model_size, device="cpu", compute_type="int8", cpu_threads=threads
+        )
+        print(f"[whisper] {model_size} ready")
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
         self._running = False
 
     async def run(self, on_transcript: TranscriptCallback) -> None:
@@ -166,42 +259,103 @@ class FasterWhisperStreamer:
 
         buffer = bytearray()
         silence_accum = 0.0
+        heard_speech = False  # don't emit finals for buffers that were pure silence
         utterance_id = 0
         window_bytes = int(self.WINDOW_S * SAMPLE_RATE) * 2
         block_seconds = BLOCK_SIZE / SAMPLE_RATE
+        max_bytes = int(self.MAX_UTTERANCE_S * SAMPLE_RATE) * 2
+        rms_hist: deque[float] = deque(maxlen=max(8, int(self.AMBIENT_WINDOW_S / block_seconds)))
+        speech_run = 0.0
+
+        def ambient_floor() -> float:
+            if len(rms_hist) < 8:
+                return float(self.SILENCE_RMS_THRESHOLD)
+            ordered = sorted(rms_hist)
+            return ordered[len(ordered) // 5]
+
+        def above_ambient(rms: float) -> bool:
+            floor = ambient_floor()
+            return rms > max(float(self.SILENCE_RMS_THRESHOLD), floor * 1.75, floor + 320)
 
         try:
             while self._running:
                 chunk = await mic.get()
+                if not chunk:
+                    continue
                 buffer.extend(chunk)
 
                 samples = np.frombuffer(chunk, dtype=np.int16)
                 rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))) if len(samples) else 0.0
 
-                if rms < self.SILENCE_RMS_THRESHOLD:
-                    silence_accum += block_seconds
-                else:
+                # Music stays at full volume, including while you sing. A command
+                # is a jump above that level, so the song itself never counts as
+                # silence and the phrase still closes when you stop talking.
+                if not heard_speech:
+                    rms_hist.append(rms)
+                if above_ambient(rms):
+                    speech_run += block_seconds
                     silence_accum = 0.0
+                    if speech_run >= self.SPEECH_HOLD_S:
+                        if not heard_speech:
+                            preroll = int(0.35 * SAMPLE_RATE) * 2
+                            if len(buffer) > preroll:
+                                del buffer[:-preroll]
+                        heard_speech = True
+                else:
+                    speech_run = 0.0
+                    if heard_speech:
+                        silence_accum += block_seconds
 
-                if len(buffer) >= window_bytes:
-                    text = self._transcribe(bytes(buffer))
-                    if text:
-                        on_transcript(text, False, False, utterance_id)
+                if not heard_speech and len(buffer) > window_bytes:
+                    # Nothing but room noise so far - keep only the most
+                    # recent window so a long quiet spell doesn't turn into a
+                    # huge buffer the moment someone finally speaks.
+                    del buffer[:-window_bytes]
+                    continue
 
-                if silence_accum >= self.SILENCE_S and len(buffer) > 0:
-                    text = self._transcribe(bytes(buffer))
-                    if text:
-                        on_transcript(text, True, True, utterance_id)
+                should_finalize = heard_speech and (
+                    silence_accum >= self.SILENCE_S or len(buffer) >= max_bytes
+                )
+                if should_finalize:
+                    pcm = bytes(buffer)
+                    uid = utterance_id
                     utterance_id += 1
                     buffer.clear()
                     silence_accum = 0.0
+                    heard_speech = False
+                    speech_run = 0.0
+                    text = await loop.run_in_executor(self._executor, self._transcribe, pcm)
+                    if text:
+                        on_transcript(text, True, True, uid)
         finally:
             mic.stop()
 
     def _transcribe(self, pcm_bytes: bytes) -> str:
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        segments, _ = self._model.transcribe(audio, language="en", vad_filter=True)
-        return " ".join(seg.text.strip() for seg in segments).strip()
+        started = time.perf_counter()
+        segments, _ = self._model.transcribe(
+            audio,
+            language=self._language,
+            beam_size=1,
+            temperature=0.0,
+            vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 500, "speech_pad_ms": 400},
+            condition_on_previous_text=False,
+            compression_ratio_threshold=2.4,
+            log_prob_threshold=-1.0,
+            no_speech_threshold=0.6,
+            without_timestamps=True,
+            # Do NOT put example commands in initial_prompt. Whisper copies
+            # them into the output whenever the audio is music/noise - that
+            # is why "Hey Jarvis, open Chrome" kept firing by itself.
+            initial_prompt="Jarvis.",
+        )
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        audio_s = len(pcm_bytes) / (SAMPLE_RATE * 2)
+        print(f"[whisper] {audio_s:.1f}s audio in {time.perf_counter() - started:.2f}s -> {text!r}")
+        if _is_hallucination(text):
+            return ""
+        return text
 
     def stop(self) -> None:
         self._running = False
@@ -213,4 +367,4 @@ def make_streamer(deepgram_api_key: Optional[str], backend_override: Optional[st
         if not deepgram_api_key:
             raise RuntimeError("STT_BACKEND=deepgram but DEEPGRAM_API_KEY is not set")
         return DeepgramStreamer(deepgram_api_key)
-    return FasterWhisperStreamer()
+    return FasterWhisperStreamer(resolve_whisper_model(), resolve_stt_language())

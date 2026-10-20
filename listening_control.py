@@ -16,7 +16,7 @@ and acted on unconditionally and continuously:
     Home too, they just don't act on anything until the wake word fires
     locally). What WakeWordGate guarantees is that no transcript reaches
     the UI or the intent engine - i.e. nothing is *shown* or *acted on* -
-    until an utterance actually starts with "animus" / "hey animus", and
+    until an utterance actually starts with "jarvis" / "hey jarvis", and
     only the text after the wake phrase is forwarded.
 """
 
@@ -26,7 +26,20 @@ import re
 import threading
 from typing import Callable, Optional
 
-WAKE_PATTERN = re.compile(r"\b(?:hey\s+)?animus\b[,:]?\s*", re.IGNORECASE)
+# Whisper (English models + German accent) constantly mangles "Jarvis" into
+# nearby English words. Treat the ones we have actually seen in live logs
+# as the same wake word so a good command isn't dropped.
+WAKE_PATTERN = re.compile(
+    r"\b(?:(?:hey|hallo)\s+)?(?:"
+    r"j[ae]rv(?:is|es|ets|ish|as|a)|jerva|jaravis|jairus|"
+    r"d[aeo]rv(?:is|es|us|ish)|darva'?s?|derbys|"
+    r"doris|drivers|"
+    r"java'?s|javas|jaws|"
+    r"job\s+is|"
+    r"travis"
+    r")\b[,:]?\s*",
+    re.IGNORECASE,
+)
 
 
 class WakeWordGate:

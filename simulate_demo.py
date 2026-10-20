@@ -125,7 +125,7 @@ def run() -> int:
     app = QApplication(sys.argv)
     overlay = PillOverlay()
     overlay.show()
-    overlay.flash_active()  # exercise the instant cyan "ANIMUS LISTENING" pop
+    overlay.flash_active()  # exercise the instant cyan "JARVIS LISTENING" pop
     overlay.set_listening(True)
 
     fired_log: list[str] = []

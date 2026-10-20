@@ -22,6 +22,7 @@ import asyncio
 import os
 import sys
 import threading
+import time
 
 from dotenv import load_dotenv
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import QApplication, QMenu, QStyle, QSystemTrayIcon
 from intent_engine import IntentEngine
 from listening_control import PushToTalkController, WakeWordGate
 from overlay_widget import PillOverlay
+from speech import Speaker, looks_like_echo, phrase_for_label
 from voice_stream import make_streamer
 
 
@@ -99,7 +101,32 @@ def main() -> int:
 
     bridge = VoicePipelineBridge()
 
+    # After an action (especially play) the mic hears the song / the app
+    # launching and Whisper invents "Hey Jarvis, open Chrome". The spoken
+    # confirmation is the same problem: ignore transcripts while the voice
+    # is talking, and drop a later transcript that is just that sentence.
+    ignore_stt_until = 0.0
+    ACTION_ECHO_S = 0.8
+    SPEECH_TAIL_S = 2.5
+    recent_speech: list[tuple[float, str]] = []
+    stt_language = (os.environ.get("STT_LANGUAGE") or "en").strip().lower()
+    speaker = Speaker()
+    speaker.start()
+
+    def speech_finished() -> None:
+        nonlocal ignore_stt_until
+        ignore_stt_until = time.monotonic() + SPEECH_TAIL_S
+
     def dispatch_action_label(label: str) -> None:
+        nonlocal ignore_stt_until
+        phrase = phrase_for_label(label, stt_language)
+        if phrase and speaker.speak(phrase, on_idle=speech_finished):
+            recent_speech.append((time.monotonic(), phrase))
+            del recent_speech[:-4]
+            # Ceiling while SAPI is talking. speech_finished() shortens it.
+            ignore_stt_until = time.monotonic() + 12
+        else:
+            ignore_stt_until = max(ignore_stt_until, time.monotonic() + ACTION_ECHO_S)
         bridge.action_started.emit(label)
 
     intent_engine = IntentEngine(on_action_started=dispatch_action_label)
@@ -110,7 +137,7 @@ def main() -> int:
     # overlay's state explicitly (flash_active() / set_listening(False)) at
     # the moments that actually matter (hotkey press, wake word heard,
     # utterance done). Connecting it here as well would immediately
-    # overwrite the "ANIMUS LISTENING" pop with the plain "Listening..."
+    # overwrite the "JARVIS LISTENING" pop with the plain "Listening..."
     # state within milliseconds, since the streamer starts well before any
     # words are transcribed.
     bridge.action_started.connect(overlay.show_action)
@@ -122,8 +149,17 @@ def main() -> int:
     def handle_transcript(text: str, is_final: bool, speech_final: bool, utterance_id: int) -> None:
         # Already on the Qt main thread here (queued-connection delivery of
         # transcript_received), so touching the overlay directly is safe.
+        if time.monotonic() < ignore_stt_until:
+            return
+        now = time.monotonic()
+        if any(now - spoken_at < 8 and looks_like_echo(text, phrase) for spoken_at, phrase in recent_speech):
+            print(f"[stt] #{utterance_id} ignored own voice: {text!r}")
+            return
+        kind = "FINAL  " if speech_final else "partial"
         if listening_mode == "wakeword":
             stripped = wake_gate.process(text, utterance_id, speech_final)
+            gate = "ignored (no wake word)" if stripped is None else f"-> {stripped!r}"
+            print(f"[stt] #{utterance_id} {kind} heard={text!r}  {gate}")
             if stripped is None:
                 return  # not woken up yet - don't show or act on overheard speech
             if utterance_id not in awake_utterances:
@@ -135,6 +171,7 @@ def main() -> int:
                 awake_utterances.discard(utterance_id)
                 overlay.set_listening(False)  # back to idle/hint until the next wake word
         else:
+            print(f"[stt] #{utterance_id} {kind} heard={text!r}")
             overlay.update_transcript(text)
             intent_engine.on_transcript(text, is_final, speech_final, utterance_id)
 
@@ -144,7 +181,7 @@ def main() -> int:
     ptt_controller: PushToTalkController | None = None
 
     if listening_mode == "wakeword":
-        overlay.set_idle_hint('Say "Hey Animus"')
+        overlay.set_idle_hint('Say "Hey Jarvis"')
         voice_thread_box[0] = VoiceThread(bridge)
         voice_thread_box[0].start()
     else:
@@ -179,6 +216,7 @@ def main() -> int:
     def on_about_to_quit() -> None:
         if ptt_controller is not None:
             ptt_controller.stop()
+        speaker.stop()
         vt = voice_thread_box[0]
         if vt is not None:
             vt.stop()
