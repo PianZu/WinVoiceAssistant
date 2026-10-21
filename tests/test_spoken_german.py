@@ -83,6 +83,14 @@ class GermanCommands(unittest.TestCase):
         assert remainder is not None
         self.assertIn("öffne", remainder.lower())
 
+    def test_wake_phrase_can_follow_the_command(self) -> None:
+        gate = listening_control.WakeWordGate()
+        remainder = gate.process("minimiere das Fenster Jarvis", utterance_id=2, speech_final=True)
+        self.assertIsNotNone(remainder)
+        assert remainder is not None
+        self.assertIn("minimiere", remainder.lower())
+        self.assertNotIn("jarvis", remainder.lower())
+
 
 class WhisperModelSelection(unittest.TestCase):
     def test_english_only_checkpoint_is_swapped_for_german(self) -> None:

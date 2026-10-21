@@ -33,6 +33,7 @@ from intent_engine import IntentEngine
 from listening_control import PushToTalkController, WakeWordGate
 from overlay_widget import PillOverlay
 from speech import Speaker, looks_like_echo, phrase_for_label
+import voice_stream
 from voice_stream import make_streamer
 
 
@@ -47,9 +48,10 @@ class VoicePipelineBridge(QObject):
 
 
 class VoiceThread(threading.Thread):
-    def __init__(self, bridge: VoicePipelineBridge) -> None:
+    def __init__(self, bridge: VoicePipelineBridge, wake_word: bool = False) -> None:
         super().__init__(daemon=True)
         self._bridge = bridge
+        self._wake_word = wake_word
         self._loop: asyncio.AbstractEventLoop | None = None
         self._streamer = None
 
@@ -59,7 +61,7 @@ class VoiceThread(threading.Thread):
 
         deepgram_key = os.environ.get("DEEPGRAM_API_KEY") or None
         backend_override = os.environ.get("STT_BACKEND") or None
-        self._streamer = make_streamer(deepgram_key, backend_override)
+        self._streamer = make_streamer(deepgram_key, backend_override, wake_word=self._wake_word)
 
         self._bridge.listening_changed.emit(True)
 
@@ -107,7 +109,10 @@ def main() -> int:
     # is talking, and drop a later transcript that is just that sentence.
     ignore_stt_until = 0.0
     ACTION_ECHO_S = 0.8
-    SPEECH_TAIL_S = 2.5
+    # Short on purpose: a longer deaf window swallowed the next command
+    # the moment the confirmation finished. Echo matching still drops the
+    # sentence Jarvis itself just spoke.
+    SPEECH_TAIL_S = 0.8
     recent_speech: list[tuple[float, str]] = []
     stt_language = (os.environ.get("STT_LANGUAGE") or "en").strip().lower()
     speaker = Speaker()
@@ -120,6 +125,7 @@ def main() -> int:
     def dispatch_action_label(label: str) -> None:
         nonlocal ignore_stt_until
         phrase = phrase_for_label(label, stt_language)
+        shown = label[4:].strip() if label.startswith("SAY:") else label
         if phrase and speaker.speak(phrase, on_idle=speech_finished):
             recent_speech.append((time.monotonic(), phrase))
             del recent_speech[:-4]
@@ -127,7 +133,7 @@ def main() -> int:
             ignore_stt_until = time.monotonic() + 12
         else:
             ignore_stt_until = max(ignore_stt_until, time.monotonic() + ACTION_ECHO_S)
-        bridge.action_started.emit(label)
+        bridge.action_started.emit(shown)
 
     intent_engine = IntentEngine(on_action_started=dispatch_action_label)
 
@@ -156,7 +162,17 @@ def main() -> int:
             print(f"[stt] #{utterance_id} ignored own voice: {text!r}")
             return
         kind = "FINAL  " if speech_final else "partial"
-        if listening_mode == "wakeword":
+        if listening_mode == "wakeword" and voice_stream.wake_model_is_ready():
+            stripped = wake_gate.strip(text)
+            if not stripped:
+                return
+            print(f"[stt] #{utterance_id} {kind} heard={text!r}  -> {stripped!r}")
+            overlay.flash_active()
+            overlay.update_transcript(stripped)
+            intent_engine.on_transcript(stripped, is_final, speech_final, utterance_id)
+            if speech_final:
+                overlay.set_listening(False)
+        elif listening_mode == "wakeword":
             stripped = wake_gate.process(text, utterance_id, speech_final)
             gate = "ignored (no wake word)" if stripped is None else f"-> {stripped!r}"
             print(f"[stt] #{utterance_id} {kind} heard={text!r}  {gate}")
@@ -182,7 +198,7 @@ def main() -> int:
 
     if listening_mode == "wakeword":
         overlay.set_idle_hint('Say "Hey Jarvis"')
-        voice_thread_box[0] = VoiceThread(bridge)
+        voice_thread_box[0] = VoiceThread(bridge, wake_word=True)
         voice_thread_box[0].start()
     else:
         overlay.set_idle_hint("Hold Right Alt to talk  •  Ctrl+Alt+A to toggle")

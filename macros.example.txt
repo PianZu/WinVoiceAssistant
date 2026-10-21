@@ -1,0 +1,4 @@
+# One phrase per line. Several commands are separated by |
+# "starte Arbeitsmodus" and "Arbeitsmodus" both match the name.
+arbeitsmodus = open slack | open chrome | open spotify
+work mode = open slack | open chrome | open spotify

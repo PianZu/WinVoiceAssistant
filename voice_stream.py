@@ -148,6 +148,93 @@ class _MicSource:
     async def get(self) -> bytes:
         return await self._queue.get()
 
+    def wake(self) -> None:
+        """Unblock get() from another thread so a stop can flush the buffer."""
+        self._loop.call_soon_threadsafe(self._queue.put_nowait, b"")
+
+
+class UtteranceSegmenter:
+    """Turns mic blocks into one PCM clip per spoken phrase.
+
+    A phrase closes after a short silence, or when flush() is called because
+    listening stopped — otherwise the audio recorded so far was thrown away
+    and the command never ran.
+    """
+
+    def __init__(self) -> None:
+        self.buffer = bytearray()
+        self.silence_accum = 0.0
+        self.heard_speech = False
+        self.speech_run = 0.0
+        self._block_seconds = BLOCK_SIZE / SAMPLE_RATE
+        self._window_bytes = int(FasterWhisperStreamer.WINDOW_S * SAMPLE_RATE) * 2
+        self._max_bytes = int(FasterWhisperStreamer.MAX_UTTERANCE_S * SAMPLE_RATE) * 2
+        self._rms_hist: deque[float] = deque(
+            maxlen=max(8, int(FasterWhisperStreamer.AMBIENT_WINDOW_S / self._block_seconds))
+        )
+
+    def push(self, chunk: bytes) -> Optional[bytes]:
+        if not chunk:
+            return None
+        self.buffer.extend(chunk)
+        samples = np.frombuffer(chunk, dtype=np.int16)
+        rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))) if len(samples) else 0.0
+
+        # Music stays at full volume, including while you sing. A command
+        # is a jump above that level, so the song itself never counts as
+        # silence and the phrase still closes when you stop talking.
+        if not self.heard_speech:
+            self._rms_hist.append(rms)
+        if self._above_ambient(rms):
+            self.speech_run += self._block_seconds
+            self.silence_accum = 0.0
+            if self.speech_run >= FasterWhisperStreamer.SPEECH_HOLD_S:
+                if not self.heard_speech:
+                    preroll = int(0.35 * SAMPLE_RATE) * 2
+                    if len(self.buffer) > preroll:
+                        del self.buffer[:-preroll]
+                self.heard_speech = True
+        else:
+            self.speech_run = 0.0
+            if self.heard_speech:
+                self.silence_accum += self._block_seconds
+
+        if not self.heard_speech and len(self.buffer) > self._window_bytes:
+            del self.buffer[:-self._window_bytes]
+            return None
+
+        should_finalize = self.heard_speech and (
+            self.silence_accum >= FasterWhisperStreamer.SILENCE_S or len(self.buffer) >= self._max_bytes
+        )
+        if not should_finalize:
+            return None
+        return self._take()
+
+    def flush(self) -> Optional[bytes]:
+        if not self.heard_speech or not self.buffer:
+            self._clear()
+            return None
+        return self._take()
+
+    def _take(self) -> bytes:
+        pcm = bytes(self.buffer)
+        self._clear()
+        return pcm
+
+    def _clear(self) -> None:
+        self.buffer.clear()
+        self.silence_accum = 0.0
+        self.heard_speech = False
+        self.speech_run = 0.0
+
+    def _above_ambient(self, rms: float) -> bool:
+        if len(self._rms_hist) < 8:
+            floor = float(FasterWhisperStreamer.SILENCE_RMS_THRESHOLD)
+        else:
+            ordered = sorted(self._rms_hist)
+            floor = ordered[len(ordered) // 5]
+        return rms > max(float(FasterWhisperStreamer.SILENCE_RMS_THRESHOLD), floor * 1.75, floor + 320)
+
 
 class DeepgramStreamer:
     def __init__(self, api_key: str) -> None:
@@ -237,7 +324,7 @@ class FasterWhisperStreamer:
     SPEECH_HOLD_S = 0.12  # ignore single drum hits
     AMBIENT_WINDOW_S = 1.5
 
-    def __init__(self, model_size: str = "small", language: str = "en") -> None:
+    def __init__(self, model_size: str = "small", language: str = "en", wake_word: bool = False) -> None:
         from faster_whisper import WhisperModel
 
         self._model_size = model_size
@@ -248,87 +335,98 @@ class FasterWhisperStreamer:
             model_size, device="cpu", compute_type="int8", cpu_threads=threads
         )
         print(f"[whisper] {model_size} ready")
+        self._use_wake = wake_word
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="whisper")
         self._running = False
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._mic: Optional[_MicSource] = None
 
     async def run(self, on_transcript: TranscriptCallback) -> None:
         loop = asyncio.get_running_loop()
         mic = _MicSource(loop)
         mic.start()
+        self._loop = loop
+        self._mic = mic
         self._running = True
-
-        buffer = bytearray()
-        silence_accum = 0.0
-        heard_speech = False  # don't emit finals for buffers that were pure silence
+        segmenter = UtteranceSegmenter()
         utterance_id = 0
-        window_bytes = int(self.WINDOW_S * SAMPLE_RATE) * 2
-        block_seconds = BLOCK_SIZE / SAMPLE_RATE
-        max_bytes = int(self.MAX_UTTERANCE_S * SAMPLE_RATE) * 2
-        rms_hist: deque[float] = deque(maxlen=max(8, int(self.AMBIENT_WINDOW_S / block_seconds)))
-        speech_run = 0.0
+        detector = None
+        if self._use_wake:
+            import wake_model
 
-        def ambient_floor() -> float:
-            if len(rms_hist) < 8:
-                return float(self.SILENCE_RMS_THRESHOLD)
-            ordered = sorted(rms_hist)
-            return ordered[len(ordered) // 5]
+            global _wake_ready
+            loaded = wake_model.load()
+            _wake_ready = loaded.available
+            detector = loaded if loaded.available else None
 
-        def above_ambient(rms: float) -> bool:
-            floor = ambient_floor()
-            return rms > max(float(self.SILENCE_RMS_THRESHOLD), floor * 1.75, floor + 320)
+        async def emit(pcm: bytes) -> None:
+            nonlocal utterance_id
+            uid = utterance_id
+            utterance_id += 1
+            text = await loop.run_in_executor(self._executor, self._transcribe, pcm)
+            if text:
+                on_transcript(text, True, True, uid)
 
         try:
-            while self._running:
-                chunk = await mic.get()
-                if not chunk:
-                    continue
-                buffer.extend(chunk)
-
-                samples = np.frombuffer(chunk, dtype=np.int16)
-                rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))) if len(samples) else 0.0
-
-                # Music stays at full volume, including while you sing. A command
-                # is a jump above that level, so the song itself never counts as
-                # silence and the phrase still closes when you stop talking.
-                if not heard_speech:
-                    rms_hist.append(rms)
-                if above_ambient(rms):
-                    speech_run += block_seconds
-                    silence_accum = 0.0
-                    if speech_run >= self.SPEECH_HOLD_S:
-                        if not heard_speech:
-                            preroll = int(0.35 * SAMPLE_RATE) * 2
-                            if len(buffer) > preroll:
-                                del buffer[:-preroll]
-                        heard_speech = True
-                else:
-                    speech_run = 0.0
-                    if heard_speech:
-                        silence_accum += block_seconds
-
-                if not heard_speech and len(buffer) > window_bytes:
-                    # Nothing but room noise so far - keep only the most
-                    # recent window so a long quiet spell doesn't turn into a
-                    # huge buffer the moment someone finally speaks.
-                    del buffer[:-window_bytes]
-                    continue
-
-                should_finalize = heard_speech and (
-                    silence_accum >= self.SILENCE_S or len(buffer) >= max_bytes
-                )
-                if should_finalize:
-                    pcm = bytes(buffer)
-                    uid = utterance_id
-                    utterance_id += 1
-                    buffer.clear()
-                    silence_accum = 0.0
-                    heard_speech = False
-                    speech_run = 0.0
-                    text = await loop.run_in_executor(self._executor, self._transcribe, pcm)
-                    if text:
-                        on_transcript(text, True, True, uid)
+            if detector is not None:
+                await self._run_until_stopped(mic, segmenter, emit, detector)
+            else:
+                while self._running:
+                    chunk = await mic.get()
+                    if not self._running or not chunk:
+                        break
+                    pcm = segmenter.push(chunk)
+                    if pcm:
+                        await emit(pcm)
         finally:
-            mic.stop()
+            try:
+                # Listening stopped mid-sentence: transcribe what was already
+                # said instead of dropping the buffer on the floor.
+                pcm = segmenter.flush()
+                if pcm:
+                    await emit(pcm)
+            finally:
+                mic.stop()
+                self._mic = None
+
+    async def _run_until_stopped(self, mic: _MicSource, segmenter: UtteranceSegmenter, emit, detector) -> None:
+        """Score audio with the wake model. Whisper runs only after a hit."""
+        from collections import deque
+
+        preroll: deque[bytes] = deque(maxlen=max(8, int(1.5 / (BLOCK_SIZE / SAMPLE_RATE))))
+        asleep = True
+        while self._running:
+            chunk = await mic.get()
+            if not self._running or not chunk:
+                break
+            if asleep:
+                preroll.append(chunk)
+                if not detector.consume(chunk):
+                    continue
+                print("[wake] hey jarvis")
+                asleep = False
+                segmenter = UtteranceSegmenter()
+                for old in preroll:
+                    pcm = segmenter.push(old)
+                    if pcm:
+                        await emit(pcm)
+                        detector.reset()
+                        preroll.clear()
+                        asleep = True
+                        segmenter = UtteranceSegmenter()
+                        break
+                continue
+            pcm = segmenter.push(chunk)
+            if pcm:
+                await emit(pcm)
+                detector.reset()
+                preroll.clear()
+                asleep = True
+                segmenter = UtteranceSegmenter()
+        if not asleep:
+            pcm = segmenter.flush()
+            if pcm:
+                await emit(pcm)
 
     def _transcribe(self, pcm_bytes: bytes) -> str:
         audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -343,7 +441,9 @@ class FasterWhisperStreamer:
             condition_on_previous_text=False,
             compression_ratio_threshold=2.4,
             log_prob_threshold=-1.0,
-            no_speech_threshold=0.6,
+            # Higher means "only drop a clip when Whisper is very sure it is
+            # silence". 0.6 was discarding short, quiet commands.
+            no_speech_threshold=0.85,
             without_timestamps=True,
             # Do NOT put example commands in initial_prompt. Whisper copies
             # them into the output whenever the audio is music/noise - that
@@ -359,12 +459,26 @@ class FasterWhisperStreamer:
 
     def stop(self) -> None:
         self._running = False
+        mic = self._mic
+        if mic is not None:
+            mic.wake()
 
 
-def make_streamer(deepgram_api_key: Optional[str], backend_override: Optional[str] = None):
+_wake_ready = False
+
+
+def wake_model_is_ready() -> bool:
+    return _wake_ready
+
+
+def make_streamer(
+    deepgram_api_key: Optional[str],
+    backend_override: Optional[str] = None,
+    wake_word: bool = False,
+):
     backend = backend_override or ("deepgram" if deepgram_api_key else "whisper")
     if backend == "deepgram":
         if not deepgram_api_key:
             raise RuntimeError("STT_BACKEND=deepgram but DEEPGRAM_API_KEY is not set")
         return DeepgramStreamer(deepgram_api_key)
-    return FasterWhisperStreamer(resolve_whisper_model(), resolve_stt_language())
+    return FasterWhisperStreamer(resolve_whisper_model(), resolve_stt_language(), wake_word=wake_word)

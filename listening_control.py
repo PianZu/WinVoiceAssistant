@@ -30,9 +30,10 @@ from typing import Callable, Optional
 # nearby English words. Treat the ones we have actually seen in live logs
 # as the same wake word so a good command isn't dropped.
 WAKE_PATTERN = re.compile(
-    r"\b(?:(?:hey|hallo)\s+)?(?:"
-    r"j[ae]rv(?:is|es|ets|ish|as|a)|jerva|jaravis|jairus|"
-    r"d[aeo]rv(?:is|es|us|ish)|darva'?s?|derbys|"
+    r"\b(?:(?:hey|hallo|ok|okay)\s+)?(?:"
+    r"j[ae]r(?:v|w)(?:is|es|ets|ish|as|a|iz)|jerva|jaravis|jairus|jarwis|"
+    r"d[aeo]r(?:v|w)(?:is|es|us|ish)|darva'?s?|derbys|"
+    r"dscharvis|t?scharvis|charvis|yarvis|"
     r"doris|drivers|"
     r"java'?s|javas|jaws|"
     r"job\s+is|"
@@ -54,7 +55,12 @@ class WakeWordGate:
         match = WAKE_PATTERN.search(text)
         if match:
             self._awake_utterance_id = utterance_id
-            remainder = text[match.end():]
+            # The name can sit before or after the command ("Jarvis, minimiere"
+            # and "minimiere das Fenster, Jarvis"). Keep both sides.
+            remainder = f"{text[:match.start()]} {text[match.end():]}"
+            remainder = re.sub(r"\s+", " ", remainder).strip(" ,")
+            if not remainder:
+                remainder = None
         elif self._awake_utterance_id == utterance_id:
             # Same utterance already woke us up on an earlier (shorter)
             # partial; keep forwarding even if this exact revision's search
@@ -67,6 +73,18 @@ class WakeWordGate:
             self._awake_utterance_id = None  # back to sleep for the next utterance
 
         return remainder
+
+    def strip(self, text: str) -> str:
+        """Drop the wake phrase when the audio model already accepted this utterance.
+
+        Whisper sometimes still writes "hey jarvis" into the command. If the
+        name is missing, the text is kept: the model already decided to listen.
+        """
+        match = WAKE_PATTERN.search(text)
+        if not match:
+            return text.strip()
+        remainder = f"{text[:match.start()]} {text[match.end():]}"
+        return re.sub(r"\s+", " ", remainder).strip(" ,")
 
 
 class PushToTalkController:

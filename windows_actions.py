@@ -14,11 +14,14 @@ passed.
 from __future__ import annotations
 
 import ctypes
+from ctypes import wintypes
 import os
 import re
 import shutil
 import subprocess
+import threading
 import time
+import uuid
 import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
@@ -632,6 +635,396 @@ def take_photo_countdown(seconds: int = 3, on_tick=None, save_dir: Optional[Path
     return PhotoResult(path=out_path, message=f"Saved photo to {out_path}")
 
 
+# ---------------------------------------------------------------------------
+# System volume (default playback device — not Spotify)
+# ---------------------------------------------------------------------------
+
+# Each "computer louder" / "computer quieter" step. Spotify's own nudge is
+# separate and stays on the music commands.
+SYSTEM_VOLUME_STEP = 10
+
+_CLSCTX_ALL = 23
+_E_RENDER = 0
+_E_CONSOLE = 0
+_COINIT_APARTMENTTHREADED = 0x2
+_RPC_E_CHANGED_MODE = 0x80010106
+
+_com_ready = threading.local()
+_ole32 = None
+_user32_dll = None
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+def _guid(text: str) -> GUID:
+    return GUID.from_buffer_copy(uuid.UUID(text).bytes_le)
+
+
+def _ole32_dll():
+    global _ole32
+    if _ole32 is None:
+        dll = ctypes.WinDLL("ole32", use_last_error=True)
+        dll.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+        dll.CoInitializeEx.restype = ctypes.c_long
+        dll.CoCreateInstance.argtypes = [
+            ctypes.POINTER(GUID),
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.POINTER(GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        dll.CoCreateInstance.restype = ctypes.c_long
+        _ole32 = dll
+    return _ole32
+
+
+def _user32():
+    global _user32_dll
+    if _user32_dll is None:
+        dll = ctypes.WinDLL("user32", use_last_error=True)
+        dll.GetForegroundWindow.restype = ctypes.c_void_p
+        dll.IsWindowVisible.argtypes = [ctypes.c_void_p]
+        dll.IsWindowVisible.restype = ctypes.c_int
+        dll.GetWindowTextLengthW.argtypes = [ctypes.c_void_p]
+        dll.GetWindowTextLengthW.restype = ctypes.c_int
+        dll.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        dll.GetWindowTextW.restype = ctypes.c_int
+        dll.GetClassNameW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        dll.GetClassNameW.restype = ctypes.c_int
+        dll.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+        dll.GetWindowThreadProcessId.restype = wintypes.DWORD
+        dll.EnumWindows.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        dll.EnumWindows.restype = ctypes.c_int
+        dll.GetWindowRect.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        dll.GetWindowRect.restype = ctypes.c_int
+        dll.ShowWindow.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        dll.ShowWindow.restype = ctypes.c_int
+        dll.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+        dll.SetForegroundWindow.restype = ctypes.c_int
+        dll.BringWindowToTop.argtypes = [ctypes.c_void_p]
+        dll.BringWindowToTop.restype = ctypes.c_int
+        dll.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, ctypes.c_int]
+        dll.AttachThreadInput.restype = ctypes.c_int
+        dll.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte, ctypes.c_ulong, ctypes.c_void_p]
+        _user32_dll = dll
+    return _user32_dll
+
+
+def _ensure_com() -> None:
+    if getattr(_com_ready, "ok", False):
+        return
+    hr = _ole32_dll().CoInitializeEx(None, _COINIT_APARTMENTTHREADED)
+    if hr < 0 and (hr & 0xFFFFFFFF) != _RPC_E_CHANGED_MODE:
+        raise ActionError(f"COM init failed ({hr & 0xFFFFFFFF:08X})")
+    _com_ready.ok = True
+
+
+def _com_method(ptr: int, index: int, restype, argtypes):
+    vtbl = ctypes.cast(ctypes.c_void_p(ptr), ctypes.POINTER(ctypes.c_void_p))[0]
+    fn = ctypes.cast(vtbl, ctypes.POINTER(ctypes.c_void_p))[index]
+    return ctypes.WINFUNCTYPE(restype, ctypes.c_void_p, *argtypes)(fn)
+
+
+def _release(ptr: int) -> None:
+    if not ptr:
+        return
+    _com_method(ptr, 2, ctypes.c_ulong, [])(ptr)
+
+
+def _check_hr(hr: int, what: str) -> None:
+    if hr < 0:
+        raise ActionError(f"{what} failed ({hr & 0xFFFFFFFF:08X})")
+
+
+class _MasterVolume:
+    """IAudioEndpointVolume on the default render device."""
+
+    def __init__(self) -> None:
+        self._ptrs: list[int] = []
+        try:
+            self._endpoint = self._open()
+        except Exception:
+            self.close()
+            raise
+
+    def _open(self) -> int:
+        _ensure_com()
+        ole32 = _ole32_dll()
+        clsid = _guid("BCDE0395-E52F-467C-8E3D-C4579291692E")
+        iid_enum = _guid("A95664D2-9614-4F35-A746-DE8DB63617E6")
+        enumerator = ctypes.c_void_p()
+        hr = ole32.CoCreateInstance(
+            ctypes.byref(clsid), None, _CLSCTX_ALL, ctypes.byref(iid_enum), ctypes.byref(enumerator)
+        )
+        _check_hr(hr, "Audio device enumerator")
+        if not enumerator.value:
+            raise ActionError("No audio device enumerator")
+        self._ptrs.append(enumerator.value)
+
+        device = ctypes.c_void_p()
+        get_default = _com_method(
+            enumerator.value, 4, ctypes.c_long, [ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        )
+        hr = get_default(enumerator.value, _E_RENDER, _E_CONSOLE, ctypes.byref(device))
+        _check_hr(hr, "Default playback device")
+        if not device.value:
+            raise ActionError("No default playback device")
+        self._ptrs.append(device.value)
+
+        iid_volume = _guid("5CDF2C82-841E-4546-9722-0CF74078229A")
+        endpoint = ctypes.c_void_p()
+        activate = _com_method(
+            device.value,
+            3,
+            ctypes.c_long,
+            [ctypes.POINTER(GUID), ctypes.c_ulong, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],
+        )
+        hr = activate(device.value, ctypes.byref(iid_volume), _CLSCTX_ALL, None, ctypes.byref(endpoint))
+        _check_hr(hr, "Volume control")
+        if not endpoint.value:
+            raise ActionError("Volume control unavailable")
+        self._ptrs.append(endpoint.value)
+        return endpoint.value
+
+    def close(self) -> None:
+        for ptr in reversed(self._ptrs):
+            _release(ptr)
+        self._ptrs.clear()
+
+    def __enter__(self) -> "_MasterVolume":
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+    def get_scalar(self) -> float:
+        level = ctypes.c_float()
+        get_level = _com_method(self._endpoint, 9, ctypes.c_long, [ctypes.POINTER(ctypes.c_float)])
+        _check_hr(get_level(self._endpoint, ctypes.byref(level)), "Read volume")
+        return float(level.value)
+
+    def set_scalar(self, level: float) -> None:
+        set_level = _com_method(self._endpoint, 7, ctypes.c_long, [ctypes.c_float, ctypes.c_void_p])
+        _check_hr(set_level(self._endpoint, ctypes.c_float(level), None), "Set volume")
+
+    def set_mute(self, muted: bool) -> None:
+        set_mute = _com_method(self._endpoint, 14, ctypes.c_long, [ctypes.c_int, ctypes.c_void_p])
+        _check_hr(set_mute(self._endpoint, 1 if muted else 0, None), "Set mute")
+
+    def get_mute(self) -> bool:
+        muted = ctypes.c_int()
+        get_mute = _com_method(self._endpoint, 15, ctypes.c_long, [ctypes.POINTER(ctypes.c_int)])
+        _check_hr(get_mute(self._endpoint, ctypes.byref(muted)), "Read mute")
+        return bool(muted.value)
+
+
+def _clamp_percent(percent: int) -> int:
+    return max(0, min(100, int(percent)))
+
+
+def get_system_volume() -> int:
+    """Current master volume, 0–100. Returns 0 in dry-run."""
+    if DRY_RUN:
+        return 0
+    with _MasterVolume() as volume:
+        return _clamp_percent(round(volume.get_scalar() * 100))
+
+
+def set_system_volume(percent: int) -> str:
+    """Set the PC master volume. A level above 0 also unmutes."""
+    percent = _clamp_percent(percent)
+    if DRY_RUN:
+        print(f"[DRY_RUN] would set system volume to {percent}")
+        return f"System volume {percent}%"
+    with _MasterVolume() as volume:
+        volume.set_scalar(percent / 100.0)
+        if percent > 0:
+            volume.set_mute(False)
+    return f"System volume {percent}%"
+
+
+def change_system_volume(delta: int) -> str:
+    """Nudge the PC master volume by `delta` percent."""
+    if DRY_RUN:
+        direction = "up" if delta > 0 else "down"
+        print(f"[DRY_RUN] would turn system volume {direction}")
+        return f"System volume {direction}"
+    return set_system_volume(get_system_volume() + delta)
+
+
+def set_system_mute(muted: bool) -> str:
+    if DRY_RUN:
+        print(f"[DRY_RUN] would set system mute={muted}")
+        return "Muted" if muted else "Unmuted"
+    with _MasterVolume() as volume:
+        volume.set_mute(muted)
+    return "Muted" if muted else "Unmuted"
+
+
+# ---------------------------------------------------------------------------
+# Screenshot
+# ---------------------------------------------------------------------------
+
+
+def take_screenshot(save_dir: Optional[Path] = None) -> str:
+    """Grab every monitor and save a PNG under Pictures\\Screenshots."""
+    out_dir = save_dir or (Path.home() / "Pictures" / "Screenshots")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_path = out_dir / f"screenshot_{stamp}.png"
+    suffix = 2
+    while out_path.exists():
+        out_path = out_dir / f"screenshot_{stamp}_{suffix}.png"
+        suffix += 1
+    if DRY_RUN:
+        print(f"[DRY_RUN] would save screenshot to {out_path}")
+        return f"Saved screenshot to {out_path}"
+
+    try:
+        from PIL import ImageGrab
+    except ImportError as exc:
+        raise ActionError("Screenshot needs Pillow (installed with pyautogui)") from exc
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        image = ImageGrab.grab(all_screens=True)
+    except TypeError:
+        image = ImageGrab.grab()
+    image.save(out_path)
+    return f"Saved screenshot to {out_path}"
+
+
+# ---------------------------------------------------------------------------
+# Foreground window
+# ---------------------------------------------------------------------------
+
+_SW_MAXIMIZE = 3
+_SW_MINIMIZE = 6
+_SW_RESTORE = 9
+_VK_LEFT = 0x25
+_VK_RIGHT = 0x27
+_VK_LWIN = 0x5B
+_SKIP_WINDOW_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"}
+
+
+def _window_title(hwnd: int) -> str:
+    user32 = _user32()
+    length = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    return buf.value.strip()
+
+
+def _window_class(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    _user32().GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def _is_controllable(hwnd: int) -> bool:
+    if not hwnd:
+        return False
+    user32 = _user32()
+    if not user32.IsWindowVisible(hwnd):
+        return False
+    if _window_class(hwnd) in _SKIP_WINDOW_CLASSES:
+        return False
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if pid.value == os.getpid():
+        return False
+    return bool(_window_title(hwnd))
+
+
+def _foreground_hwnd() -> int:
+    """The window the user is working in, skipping the shell and this process."""
+    user32 = _user32()
+    hwnd = user32.GetForegroundWindow()
+    if _is_controllable(hwnd):
+        return int(hwnd)
+    chosen: list[int] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def visit(handle, _lparam):
+        if _is_controllable(handle):
+            chosen.append(int(handle))
+            return False
+        return True
+
+    user32.EnumWindows(visit, 0)
+    if not chosen:
+        raise ActionError("No window to control")
+    return chosen[0]
+
+
+def _focus_window(hwnd: int) -> None:
+    user32 = _user32()
+    foreground = user32.GetForegroundWindow()
+    if foreground == hwnd:
+        return
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    current = kernel32.GetCurrentThreadId()
+    fg_pid = wintypes.DWORD()
+    fg_thread = user32.GetWindowThreadProcessId(foreground, ctypes.byref(fg_pid)) if foreground else 0
+    if fg_thread:
+        user32.AttachThreadInput(current, fg_thread, True)
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    if fg_thread:
+        user32.AttachThreadInput(current, fg_thread, False)
+
+
+def _press_win_arrow(vk_arrow: int) -> None:
+    # PTT holds Right Alt. A Win+arrow injected while Alt is still down is a
+    # different shortcut, so clear modifiers the same way typing does.
+    _release_modifier_keys()
+    user32 = _user32()
+    user32.keybd_event(_VK_LWIN, 0, 0, 0)
+    user32.keybd_event(vk_arrow, 0, _KEYEVENTF_EXTENDEDKEY, 0)
+    user32.keybd_event(vk_arrow, 0, _KEYEVENTF_EXTENDEDKEY | _KEYEVENTF_KEYUP, 0)
+    user32.keybd_event(_VK_LWIN, 0, _KEYEVENTF_KEYUP, 0)
+
+
+def _show_foreground(command: int, dry_message: str, result: str) -> str:
+    if DRY_RUN:
+        print(f"[DRY_RUN] would {dry_message}")
+        return result
+    _user32().ShowWindow(_foreground_hwnd(), command)
+    return result
+
+
+def minimize_window() -> str:
+    return _show_foreground(_SW_MINIMIZE, "minimize the foreground window", "Minimized")
+
+
+def maximize_window() -> str:
+    return _show_foreground(_SW_MAXIMIZE, "maximize the foreground window", "Maximized")
+
+
+def restore_window() -> str:
+    return _show_foreground(_SW_RESTORE, "restore the foreground window", "Restored")
+
+
+def snap_window(side: str) -> str:
+    """Snap the foreground window to the left or right half of the screen."""
+    side = side.lower()
+    if side not in ("left", "right"):
+        raise ActionError(f"Unknown snap side: {side}")
+    if DRY_RUN:
+        print(f"[DRY_RUN] would snap the foreground window {side}")
+        return f"Snapped {side}"
+    hwnd = _foreground_hwnd()
+    _focus_window(hwnd)
+    _press_win_arrow(_VK_LEFT if side == "left" else _VK_RIGHT)
+    return f"Snapped {side}"
+
+
 def is_foreground_fullscreen() -> bool:
     """Best-effort check so the overlay can dim/hide itself over fullscreen apps."""
     user32 = ctypes.windll.user32
@@ -647,3 +1040,185 @@ def is_foreground_fullscreen() -> bool:
     screen_w = user32.GetSystemMetrics(0)
     screen_h = user32.GetSystemMetrics(1)
     return (win_rect.right - win_rect.left) >= screen_w and (win_rect.bottom - win_rect.top) >= screen_h
+
+
+# ---------------------------------------------------------------------------
+# Focus a window, open a known folder, find a file
+# ---------------------------------------------------------------------------
+
+_FOLDERS = {
+    "downloads": "Downloads",
+    "download": "Downloads",
+    "documents": "Documents",
+    "dokumente": "Documents",
+    "desktop": "Desktop",
+    "schreibtisch": "Desktop",
+    "pictures": "Pictures",
+    "bilder": "Pictures",
+    "music": "Music",
+    "musik": "Music",
+    "videos": "Videos",
+}
+
+_FILE_SKIP_DIRS = {"node_modules", ".git", "__pycache__", "appdata", "windows"}
+
+
+def open_folder(name: str) -> str:
+    """Open Downloads, Documents, Desktop, Pictures, Music, or Videos."""
+    key = name.strip().lower()
+    folder = _FOLDERS.get(key)
+    if folder is None:
+        raise ActionError(f"Unknown folder: {name}")
+    path = Path.home() / folder
+    if DRY_RUN:
+        print(f"[DRY_RUN] would open folder {path}")
+        return f"Opened {folder}"
+    if not path.exists():
+        raise ActionError(f"{folder} is not there")
+    _run(str(path))
+    return f"Opened {folder}"
+
+
+def focus_window(name: str) -> str:
+    """Bring a window to the front. Launches the app when none is open."""
+    import answers
+
+    cleaned = name.strip()
+    spoken_name = cleaned.title()
+    lang_de = answers.language() == "de"
+    if DRY_RUN:
+        print(f"[DRY_RUN] would focus {cleaned}")
+        sentence = f"{spoken_name} ist vorn." if lang_de else f"{spoken_name} is in front."
+        return answers.spoken(sentence)
+    hwnd = _find_window(cleaned)
+    if hwnd is None:
+        open_app(cleaned)
+        sentence = f"{spoken_name} wird geöffnet." if lang_de else f"Opening {spoken_name}."
+        return answers.spoken(sentence)
+    _focus_window(hwnd)
+    sentence = f"{spoken_name} ist vorn." if lang_de else f"{spoken_name} is in front."
+    return answers.spoken(sentence)
+
+
+def find_file(query: str, roots: Optional[list[Path]] = None) -> str:
+    """Open the best name match under Desktop, Documents, and Downloads."""
+    needle = query.strip().strip("\"'").lower()
+    if len(needle) < 2:
+        raise ActionError("Say more of the file name")
+    search_roots = roots or [Path.home() / folder for folder in ("Desktop", "Documents", "Downloads")]
+    best: Optional[Path] = None
+    best_score = -1
+    seen = 0
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d.lower() not in _FILE_SKIP_DIRS and not d.startswith(".")]
+            for filename in filenames:
+                seen += 1
+                if seen > 4000:
+                    break
+                score = _file_score(filename, needle)
+                if score > best_score:
+                    best_score = score
+                    best = Path(dirpath) / filename
+            if seen > 4000:
+                break
+        if seen > 4000:
+            break
+    if best is None or best_score < 0:
+        raise ActionError(f"No file matching {query}")
+    if DRY_RUN:
+        print(f"[DRY_RUN] would open file {best}")
+        return f"Opened {best.name}"
+    _run(str(best))
+    return f"Opened {best.name}"
+
+
+def _file_score(filename: str, needle: str) -> int:
+    lowered = filename.lower()
+    stem = Path(filename).stem.lower()
+    if stem == needle or lowered == needle:
+        return 100
+    if stem.startswith(needle):
+        return 80
+    if needle in lowered:
+        return 60
+    return -1
+
+
+def _window_exe(hwnd: int) -> str:
+    user32 = _user32()
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_wchar_p,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x1000, False, pid.value)
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(512)
+        buf = ctypes.create_unicode_buffer(512)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return ""
+        return Path(buf.value).stem.lower()
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _window_area(hwnd: int) -> int:
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    rect = RECT()
+    if not _user32().GetWindowRect(hwnd, ctypes.byref(rect)):
+        return 0
+    return max(0, rect.right - rect.left) * max(0, rect.bottom - rect.top)
+
+
+def _find_window(name: str) -> Optional[int]:
+    needle = name.strip().lower()
+    if not needle:
+        return None
+    user32 = _user32()
+    found: list[tuple[int, int]] = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def visit(handle, _lparam):
+        if not _is_controllable(handle):
+            return True
+        title = _window_title(handle).lower()
+        exe = _window_exe(handle)
+        words = set(re.split(r"[^a-z0-9äöüß+]+", title))
+        score = 0
+        if exe == needle:
+            score = 100
+        elif needle in words:
+            score = 80
+        elif needle in title:
+            score = 50
+        if score:
+            found.append((score * 1_000_000 + _window_area(handle), int(handle)))
+        return True
+
+    user32.EnumWindows(visit, 0)
+    if not found:
+        return None
+    found.sort(reverse=True)
+    return found[0][1]

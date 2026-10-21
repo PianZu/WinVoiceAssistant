@@ -12,3 +12,6 @@ pynput>=1.7.6
 
 # Optional local fallback STT (only needed if DEEPGRAM_API_KEY is not set)
 faster-whisper>=1.0.0
+
+# Optional local wake word. Without it, wakeword mode keeps the text filter.
+openwakeword>=0.6.0

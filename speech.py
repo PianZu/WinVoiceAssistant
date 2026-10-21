@@ -47,6 +47,9 @@ _DE_APPS = {
 def phrase_for_label(label: str, language: str = "de") -> Optional[str]:
     """German or English sentence for a confirmation badge, or None when
     this label should stay silent (result text, unknown badge)."""
+    if label.startswith("SAY:"):
+        sentence = label[4:].strip()
+        return sentence or None
     if (language or "").lower().startswith("de"):
         return _phrase_de(label.strip())
     return _phrase_en(label.strip())
@@ -89,6 +92,23 @@ def _phrase_de(label: str) -> Optional[str]:
         (re.compile(r"^\[VOLUME UP\]$"), lambda m: "Lauter."),
         (re.compile(r"^\[VOLUME DOWN\]$"), lambda m: "Leiser."),
         (re.compile(r"^\[VOLUME (.+)\]$"), lambda m: f"Lautstärke {m.group(1).replace('%', '').strip()}."),
+        (re.compile(r"^\[SYSTEM VOLUME UP\]$"), lambda m: "Computer lauter."),
+        (re.compile(r"^\[SYSTEM VOLUME DOWN\]$"), lambda m: "Computer leiser."),
+        (
+            re.compile(r"^\[SYSTEM VOLUME (.+)\]$"),
+            lambda m: f"Systemlautstärke {m.group(1).replace('%', '').strip()}.",
+        ),
+        (re.compile(r"^\[MUTED\]$"), lambda m: "Stumm."),
+        (re.compile(r"^\[UNMUTED\]$"), lambda m: "Ton an."),
+        (re.compile(r"^\[SCREENSHOT\]$"), lambda m: "Screenshot."),
+        (re.compile(r"^\[MINIMIZED\]$"), lambda m: "Fenster minimiert."),
+        (re.compile(r"^\[MAXIMIZED\]$"), lambda m: "Fenster maximiert."),
+        (re.compile(r"^\[RESTORED\]$"), lambda m: "Fenster wiederhergestellt."),
+        (re.compile(r"^\[WINDOW LEFT\]$"), lambda m: "Fenster nach links."),
+        (re.compile(r"^\[WINDOW RIGHT\]$"), lambda m: "Fenster nach rechts."),
+        (re.compile(r"^\[TIMER DONE\]$"), lambda m: "Der Timer ist abgelaufen."),
+        (re.compile(r"^\[FOLDER (.+)\]$"), lambda m: f"{_spoken_name(m.group(1), 'de')} wird geöffnet."),
+        (re.compile(r"^\[FILE (.+)\]$"), lambda m: f"Ich öffne {_spoken_name(m.group(1), 'de')}."),
         (re.compile(r"^\[SHUFFLE ON\]$"), lambda m: "Zufall an."),
         (re.compile(r"^\[SHUFFLE OFF\]$"), lambda m: "Zufall aus."),
     ]
@@ -117,6 +137,23 @@ def _phrase_en(label: str) -> Optional[str]:
         (re.compile(r"^\[VOLUME UP\]$"), lambda m: "Louder."),
         (re.compile(r"^\[VOLUME DOWN\]$"), lambda m: "Quieter."),
         (re.compile(r"^\[VOLUME (.+)\]$"), lambda m: f"Volume {m.group(1).replace('%', '').strip()}."),
+        (re.compile(r"^\[SYSTEM VOLUME UP\]$"), lambda m: "Computer louder."),
+        (re.compile(r"^\[SYSTEM VOLUME DOWN\]$"), lambda m: "Computer quieter."),
+        (
+            re.compile(r"^\[SYSTEM VOLUME (.+)\]$"),
+            lambda m: f"System volume {m.group(1).replace('%', '').strip()}.",
+        ),
+        (re.compile(r"^\[MUTED\]$"), lambda m: "Muted."),
+        (re.compile(r"^\[UNMUTED\]$"), lambda m: "Unmuted."),
+        (re.compile(r"^\[SCREENSHOT\]$"), lambda m: "Screenshot."),
+        (re.compile(r"^\[MINIMIZED\]$"), lambda m: "Window minimized."),
+        (re.compile(r"^\[MAXIMIZED\]$"), lambda m: "Window maximized."),
+        (re.compile(r"^\[RESTORED\]$"), lambda m: "Window restored."),
+        (re.compile(r"^\[WINDOW LEFT\]$"), lambda m: "Window left."),
+        (re.compile(r"^\[WINDOW RIGHT\]$"), lambda m: "Window right."),
+        (re.compile(r"^\[TIMER DONE\]$"), lambda m: "Timer's up."),
+        (re.compile(r"^\[FOLDER (.+)\]$"), lambda m: f"Opening {_spoken_name(m.group(1), 'en')}."),
+        (re.compile(r"^\[FILE (.+)\]$"), lambda m: f"Opening {_spoken_name(m.group(1), 'en')}."),
         (re.compile(r"^\[SHUFFLE ON\]$"), lambda m: "Shuffle on."),
         (re.compile(r"^\[SHUFFLE OFF\]$"), lambda m: "Shuffle off."),
     ]

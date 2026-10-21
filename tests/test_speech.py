@@ -22,8 +22,23 @@ class Phrases(unittest.TestCase):
         self.assertEqual(speech.phrase_for_label("[PAUSED]"), "Pause.")
         self.assertEqual(speech.phrase_for_label("[VOLUME 30%]"), "Lautstärke 30.")
         self.assertEqual(speech.phrase_for_label("[VOLUME UP]"), "Lauter.")
+        self.assertEqual(speech.phrase_for_label("[SYSTEM VOLUME 40%]"), "Systemlautstärke 40.")
+        self.assertEqual(speech.phrase_for_label("[SYSTEM VOLUME UP]"), "Computer lauter.")
+        self.assertEqual(speech.phrase_for_label("[MUTED]"), "Stumm.")
+        self.assertEqual(speech.phrase_for_label("[SCREENSHOT]"), "Screenshot.")
+        self.assertEqual(speech.phrase_for_label("[MINIMIZED]"), "Fenster minimiert.")
+        self.assertEqual(speech.phrase_for_label("[WINDOW LEFT]"), "Fenster nach links.")
         self.assertEqual(speech.phrase_for_label("[SHUFFLE ON]"), "Zufall an.")
         self.assertEqual(speech.phrase_for_label("[CAPTURING PHOTO]"), "Foto wird aufgenommen.")
+        self.assertEqual(speech.phrase_for_label("[TIMER DONE]"), "Der Timer ist abgelaufen.")
+        self.assertEqual(speech.phrase_for_label("[FOLDER DOWNLOADS]"), "Downloads wird geöffnet.")
+        self.assertEqual(speech.phrase_for_label("[FILE RECHNUNG]"), "Ich öffne Rechnung.")
+        self.assertEqual(speech.phrase_for_label("SAY:Es ist 9 Uhr."), "Es ist 9 Uhr.")
+        self.assertIsNone(speech.phrase_for_label("[TIME]"))
+        self.assertIsNone(speech.phrase_for_label("[BATTERY]"))
+        self.assertIsNone(speech.phrase_for_label("[NOW PLAYING]"))
+        self.assertIsNone(speech.phrase_for_label("[FOCUS CHROME]"))
+        self.assertIsNone(speech.phrase_for_label("[TIMER 5 MINUTES]"))
         self.assertEqual(speech.phrase_for_label("Couldn't do that: missing"), "Das hat nicht geklappt.")
 
     def test_result_text_stays_silent(self) -> None:
@@ -33,6 +48,13 @@ class Phrases(unittest.TestCase):
     def test_english_when_language_is_en(self) -> None:
         self.assertEqual(speech.phrase_for_label("[LAUNCHED CHROME]", "en"), "Opening Chrome.")
         self.assertEqual(speech.phrase_for_label("[PAUSED]", "en"), "Paused.")
+        self.assertEqual(speech.phrase_for_label("[SYSTEM VOLUME DOWN]", "en"), "Computer quieter.")
+        self.assertEqual(speech.phrase_for_label("[UNMUTED]", "en"), "Unmuted.")
+        self.assertEqual(speech.phrase_for_label("[MAXIMIZED]", "en"), "Window maximized.")
+        self.assertEqual(speech.phrase_for_label("[TIMER DONE]", "en"), "Timer's up.")
+        self.assertEqual(speech.phrase_for_label("[FOLDER DOWNLOADS]", "en"), "Opening Downloads.")
+        self.assertEqual(speech.phrase_for_label("[FILE RECHNUNG]", "en"), "Opening Rechnung.")
+        self.assertEqual(speech.phrase_for_label("SAY:It's 9:05 AM.", "en"), "It's 9:05 AM.")
 
     def test_own_voice_is_an_echo(self) -> None:
         spoken = "Chrome wird geöffnet."

@@ -424,6 +424,25 @@ def _spotify_main_hwnd() -> Optional[int]:
     return best
 
 
+def current_track_label() -> Optional[str]:
+    """Spotify window title while a track is playing, else None.
+
+    Idle Spotify titles are just "Spotify" / "Spotify Premium". A playing
+    track retitles the window to the song.
+    """
+    hwnd = _spotify_main_hwnd()
+    if not hwnd:
+        return None
+    user32 = ctypes.windll.user32
+    length = user32.GetWindowTextLengthW(hwnd)
+    buf = ctypes.create_unicode_buffer(length + 1)
+    user32.GetWindowTextW(hwnd, buf, length + 1)
+    title = buf.value.strip()
+    if title.lower() in {"", "spotify", "spotify free", "spotify premium"}:
+        return None
+    return title
+
+
 def _bring_to_front(hwnd: int) -> bool:
     """Best-effort activate without UI Automation. An Alt tap first is the
     usual way to get past Windows' foreground-lock from a background process."""

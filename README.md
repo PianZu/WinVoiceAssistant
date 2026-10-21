@@ -74,13 +74,13 @@ of two listening modes via `LISTENING_MODE` in `.env` (default: `ptt`):
   "JARVIS LISTENING" badge (no ramp-up), before showing the live transcript.
 
 **Wake word (`LISTENING_MODE=wakeword`)**
-- Say **"jarvis"** or **"hey jarvis"** to wake it up; everything before the
-  wake phrase is discarded and never shown or acted on. Only the words
-  after it are passed on as your command.
-- The mic itself streams continuously in this mode — that's unavoidable for
-  any wake-word system (something has to be listening for the trigger
-  phrase), but nothing is surfaced in the UI or executed until the wake
-  word is actually heard.
+- Say **"hey jarvis"** and then the command. With `openwakeword` installed,
+  Whisper stays idle until that phrase is heard. The name is stripped from
+  the command if the transcript still contains it.
+- Without that package, every utterance is transcribed and ignored until the
+  text contains "jarvis" or "hey jarvis".
+- The mic stays open in this mode, because something has to listen for the
+  trigger. Nothing is shown or executed until the wake phrase is heard.
 - The pill reverts to idle after each command finishes, waiting for the
   next "hey jarvis".
 
@@ -116,10 +116,30 @@ Once listening is active, try saying:
 - "Write hello from the voice assistant"
 - "Play fire force opening" / "Play the album abbey road" / "Play some lo-fi"
   — searches Spotify and starts the top hit. "Stop" / "pause" / "play" (resume) /
-  "skip" / "next" / "previous" / "volume 30" / "louder" / "shuffle on" also work. Pause / resume / next / previous /
-  "volume 30" / "louder" / "shuffle on" also work. For reliable auto-play set
-  `SPOTIFY_CLIENT_ID` in `.env` (Spotify Premium); without it Jarvis opens
-  Spotify's search page and presses Enter.
+  "skip" / "next" / "previous" / "volume 30" / "louder" / "shuffle on" also work.
+  For reliable auto-play set `SPOTIFY_CLIENT_ID` in `.env` (Spotify Premium);
+  without it Jarvis opens Spotify's search page and presses Enter.
+- "System volume 40" / "Computer louder" / "Mute" / "Unmute" — the PC volume,
+  separate from Spotify. "Volume 30" and "Louder" still change Spotify.
+  German: "Systemlautstärke 40", "Computer lauter", "Stumm", "Ton an".
+- "Screenshot" / "Take a screenshot" — saved under `Pictures\Screenshots`
+  (every monitor). German: "Mach einen Screenshot", "Bildschirmfoto".
+- "Minimize" / "Maximize" / "Restore" / "Snap left" / "Snap right" — the
+  window in front. German: "Minimiere", "Maximiere", "Wiederherstellen",
+  "Fenster nach links". "Vollbild" maximizes that window.
+- "What time is it" / "Battery" / "What's playing" — spoken answers.
+  German: "Wie spät ist es", "Akku", "Was läuft".
+- "Timer 5 minutes" / "Cancel timer" — one timer at a time, up to 24 hours.
+  German: "Timer auf 5 Minuten", "Timer abbrechen". When it ends Jarvis says
+  "Der Timer ist abgelaufen."
+- "Switch to Chrome" — focuses that window, or opens the app if it isn't
+  running. German: "Wechsle zu Chrome".
+- "Open Downloads" / "Open Documents" — known folders. German: "Öffne Downloads",
+  "Öffne Dokumente". "Musik" opens the Music folder.
+- "Find file Rechnung" — looks on the Desktop, in Documents, and in Downloads.
+  German: "Such die Datei Rechnung". "Such nach …" stays a web search.
+- "Arbeitsmodus" — runs the commands in `macros.txt` (or `macros.example.txt`
+  until you create your own). "Starte Arbeitsmodus" uses the same name.
 
 Filler words ("can you", "please", "for me") and alternate trigger verbs
 ("open", "open up", "launch", "pull up") are all handled — see

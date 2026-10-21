@@ -23,6 +23,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+import answers
+import macros
 import spotify_control as sp
 import windows_actions as wa
 
@@ -65,7 +67,8 @@ _KNOWN_SEARCH_TARGETS = r"(chrome|edge|arc|firefox|google|x|twitter)"
 # Verbs that mean "web search": "search (for) X", "look for X", "look up X",
 # "google X", "find X". The optional "for"/"up" after the verb is swallowed
 # so it never ends up in the query text.
-_SEARCH_VERB = r"(?:search|look|google|find)\s+(?:for\s+|up\s+)?"
+# "find file …" is a local file search, so that phrase is not a web search.
+_SEARCH_VERB = r"(?:search|look|google|find(?!\s+(?:the\s+)?file\b))\s+(?:for\s+|up\s+)?"
 
 # Verbs that mean "close an app". "shut down" is deliberately excluded -
 # too close to shutting down the PC; "stop" too, because "stop (the music /
@@ -134,7 +137,181 @@ def _looks_like_domain(text: str) -> Optional[str]:
     return None
 
 
+def _clamp_spoken_percent(raw: str) -> int:
+    return max(0, min(100, int(raw)))
+
+
+def _system_volume_action(match: re.Match) -> Action:
+    percent = _clamp_spoken_percent(match.group(1))
+    return Action(
+        name="system_volume",
+        signature=f"system_volume:{percent}",
+        run=lambda: wa.set_system_volume(percent),
+        display_arg=f"{percent}%",
+    )
+
+
+def _system_volume_step(up: bool) -> Action:
+    delta = wa.SYSTEM_VOLUME_STEP if up else -wa.SYSTEM_VOLUME_STEP
+    name = "system_volume_up" if up else "system_volume_down"
+    label = "UP" if up else "DOWN"
+    return Action(name=name, signature=name, run=lambda: wa.change_system_volume(delta), display_arg=label)
+
+
+def _system_mute_action(muted: bool) -> Action:
+    name = "system_mute" if muted else "system_unmute"
+    return Action(name=name, signature=name, run=lambda: wa.set_system_mute(muted))
+
+
+def _timer_action(match: re.Match) -> Action:
+    amount = int(match.group(1))
+    unit = match.group(2).lower()
+    seconds = amount * {"seconds": 1, "minutes": 60, "hours": 3600}[unit]
+    label = f"{amount} {unit}"
+    return Action(
+        name="timer_set",
+        signature=f"timer_set:{seconds}",
+        run=lambda: answers.start_timer(seconds),
+        display_arg=label,
+    )
+
+
+def _focus_action(match: re.Match) -> Action:
+    name = match.group(1).strip()
+    return Action(
+        name="focus_window",
+        signature=f"focus_window:{name.lower()}",
+        run=lambda: wa.focus_window(name),
+        display_arg=name,
+    )
+
+
+def _file_action(match: re.Match) -> Action:
+    query = match.group(1).strip()
+    return Action(
+        name="find_file",
+        signature=f"find_file:{query.lower()}",
+        run=lambda: wa.find_file(query),
+        display_arg=query,
+    )
+
+
+def _folder_action(match: re.Match) -> Action:
+    name = match.group(1).strip()
+    return Action(
+        name="open_folder",
+        signature=f"open_folder:{name.lower()}",
+        run=lambda: wa.open_folder(name),
+        display_arg=name,
+    )
+
+
+def _snap_action(match: re.Match) -> Action:
+    side = match.group(1).lower()
+    name = "window_left" if side == "left" else "window_right"
+    return Action(name=name, signature=name, run=lambda: wa.snap_window(side))
+
+
+_FOLDER_NAMES = (
+    r"downloads|download|documents|dokumente|desktop|schreibtisch|pictures|bilder|music|musik|videos"
+)
+
 _PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
+    (
+        re.compile(rf"^{_FILLER_PRE}what\s+time\s+is\s+it{_FILLER_POST}$", re.IGNORECASE),
+        lambda m: Action(name="answer_time", signature="answer_time", run=answers.tell_time),
+    ),
+    (
+        re.compile(rf"^{_FILLER_PRE}battery{_FILLER_POST}$", re.IGNORECASE),
+        lambda m: Action(name="answer_battery", signature="answer_battery", run=answers.tell_battery),
+    ),
+    (
+        re.compile(rf"^{_FILLER_PRE}whats\s+playing{_FILLER_POST}$", re.IGNORECASE),
+        lambda m: Action(name="answer_now_playing", signature="answer_now_playing", run=answers.tell_now_playing),
+    ),
+    (
+        re.compile(rf"^{_FILLER_PRE}cancel\s+(?:the\s+)?timer{_FILLER_POST}$", re.IGNORECASE),
+        lambda m: Action(name="timer_cancel", signature="timer_cancel", run=answers.cancel_timer),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}{_OPEN_TRIGGER}\s+(?:the\s+|my\s+)?({_FOLDER_NAMES})(?:\s+(?:folder|ordner))?{_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        _folder_action,
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:turn\s+)?(?:the\s+)?(?:system|computer|pc|windows)(?:\s+volume)?\s+"
+            rf"(up|down|louder|quieter){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: _system_volume_step(m.group(1).lower() in ("up", "louder")),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(un)?mute(?:\s+(?:the\s+)?(?:system|computer|pc|windows|sound|audio))?{_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: _system_mute_action(not m.group(1)),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:turn\s+)?(?:the\s+)?(?:sound|audio)\s+(off|on){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: _system_mute_action(m.group(1).lower() == "off"),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:take\s+(?:a\s+)?)?(?:screenshot|screen\s*shot|bildschirmfoto){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(name="screenshot", signature="screenshot", run=wa.take_screenshot),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:capture|grab)\s+(?:the\s+|my\s+)?screen{_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(name="screenshot", signature="screenshot", run=wa.take_screenshot),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:minimize|minimise)(?:\s+(?:the\s+|this\s+)?(?:window|app))?{_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(name="window_minimize", signature="window_minimize", run=wa.minimize_window),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:maximize|maximise)(?:\s+(?:the\s+|this\s+)?(?:window|app))?{_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(name="window_maximize", signature="window_maximize", run=wa.maximize_window),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}restore(?:\s+(?:the\s+|this\s+)?window)?{_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        lambda m: Action(name="window_restore", signature="window_restore", run=wa.restore_window),
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:snap|move|dock|put)(?:\s+(?:the\s+|this\s+)?)(?:window\s+)?"
+            rf"(?:to\s+(?:the\s+)?)?(left|right){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        _snap_action,
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}window\s+(?:to\s+(?:the\s+)?)?(left|right){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        _snap_action,
+    ),
     (
         re.compile(
             rf"^{_FILLER_PRE}(?:pause|stop|halt|quiet){_MUSIC_NOUN}{_FILLER_POST}$",
@@ -341,6 +518,39 @@ _SPOTIFY_FINAL_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] =
 
 
 _FINAL_ONLY_PATTERNS: list[tuple[re.Pattern, Callable[[re.Match], Action]]] = [
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:set\s+)?(?:a\s+)?timer\s+(?:for\s+)?(\d+)\s*"
+            rf"(seconds|minutes|hours){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        _timer_action,
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}(?:switch\s+to|focus|show)\s+(?:the\s+)?"
+            rf"([a-z0-9][\w+\-]*(?:\s+[\w+\-]+){{0,2}}){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        _focus_action,
+    ),
+    (
+        re.compile(
+            rf"^{_FILLER_PRE}find\s+(?:the\s+)?file\s+(.+?){_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        _file_action,
+    ),
+    (
+        # Final-only: a growing partial "system volume 3" must not fire
+        # before the speaker finishes "system volume 30".
+        re.compile(
+            rf"^{_FILLER_PRE}(?:set\s+)?(?:the\s+)?(?:system|computer|pc|windows)\s+volume\s+"
+            rf"(?:to\s+)?(\d{{1,3}})(?:\s*(?:percent|%))?{_FILLER_POST}$",
+            re.IGNORECASE,
+        ),
+        _system_volume_action,
+    ),
     *_SPOTIFY_FINAL_PATTERNS,
     (
         # "open <browser> and search <query>" - ties the search to the named
@@ -478,15 +688,144 @@ def _normalize_transcript(text: str) -> str:
 
 
 _DE_LEADING_FILLER = re.compile(
-    r"^(?:(?:bitte|kannst du(?: mir)?|könntest du(?: mir)?|koenntest du(?: mir)?|"
+    r"^(?:(?:bitte|mal|doch|einfach|kurz|eben|einmal|jarvis|"
+    r"kannst du(?: mir)?|könntest du(?: mir)?|koenntest du(?: mir)?|"
     r"würdest du(?: mir)?|wuerdest du(?: mir)?|hallo|hey)\s+)+"
 )
+# Spoken padding that sits between the verb and the object ("minimiere mal
+# bitte das Fenster"). Stripped as whole words so a search for "Screenshot"
+# still contains that word.
+_DE_INLINE_FILLER = re.compile(r"\b(?:bitte|mal|doch|einfach|kurz|eben|einmal|für mich|for me)\b")
 _DE_ARTICLE = r"den|die|das|dem|der|ein|eine|einen|einem"
 
 
 def _shuffle_state(match: re.Match) -> str:
     state = {"an": "on", "ein": "on", "on": "on", "aus": "off", "off": "off"}[match.group(1)]
     return f"shuffle {state}"
+
+
+def _pc_volume_direction(match: re.Match) -> str:
+    return "system volume up" if match.group(1) == "lauter" else "system volume down"
+
+
+def _snap_side(match: re.Match) -> str:
+    return "snap left" if match.group(1) == "links" else "snap right"
+
+
+def _apply_desktop_rewrites(text: str) -> str:
+    """Map one clause onto a desktop command. Anchored so a search that only
+    mentions the word "screenshot" is left alone."""
+    text = re.sub(
+        r"^(?:wechsle|wechsel(?:n)?|fokussiere|fokussier|fokus)\s+(?:zu(?:m)?\s+|auf\s+)?",
+        "switch to ",
+        text,
+    )
+    text = re.sub(
+        r"^(?:(?:mach(?:e)?|nimm)\s+)?(?:ein(?:en)?\s+)?(?:screenshot|screen\s*shot|bildschirmfoto)"
+        r"(?:\s+(?:machen|aufnehmen))?$",
+        "take a screenshot",
+        text,
+    )
+    text = re.sub(r"^bildschirm\s+aufnehmen$", "take a screenshot", text)
+    text = re.sub(r"^(?:mach(?:e)?\s+)?(?:das\s+)?(?:fenster\s+)?vollbild$", "maximize", text)
+    text = re.sub(r"^(?:mach(?:e)?\s+)?(?:das\s+)?fenster\s+kleiner$", "minimize", text)
+    text = re.sub(r"^(?:mach(?:e)?\s+)?(?:das\s+)?fenster\s+(?:größer|groesser)$", "maximize", text)
+    text = re.sub(
+        r"^(?:schieb(?:e)?|andock(?:e|en)?|dock(?:e)?)\s+(?:das\s+)?fenster\s+(?:nach\s+)?(links|rechts)$",
+        _snap_side,
+        text,
+    )
+    text = re.sub(
+        r"^(?:das\s+)?fenster\s+(?:nach\s+)?(links|rechts)(?:\s+(?:schieben|andocken|docken))?$",
+        _snap_side,
+        text,
+    )
+    text = re.sub(r"^(?:nach\s+)?(links|rechts)\s+(?:andocken|docken|schieben)$", _snap_side, text)
+    text = re.sub(r"^(?:andock(?:e|en)?|dock(?:e)?)\s+(?:nach\s+)?(links|rechts)$", _snap_side, text)
+    text = re.sub(r"^(?:das\s+)?fenster\s+(?:minimieren|verkleinern)$", "minimize", text)
+    text = re.sub(r"^(?:das\s+)?fenster\s+(?:maximieren|vergrößern|vergroessern)$", "maximize", text)
+    text = re.sub(
+        r"^(?:minimiere|minimieren|verkleinere|verkleinern)(?:\s+(?:das\s+)?fenster)?$",
+        "minimize",
+        text,
+    )
+    text = re.sub(
+        r"^(?:maximiere|maximieren|vergrößere|vergroessere|vergrößern|vergroessern)"
+        r"(?:\s+(?:das\s+)?fenster)?$",
+        "maximize",
+        text,
+    )
+    text = re.sub(r"^(?:stell(?:e)?\s+)?(?:das\s+)?fenster\s+wieder\s+her$", "restore", text)
+    text = re.sub(r"^(?:fenster\s+)?wiederherstellen$", "restore", text)
+    text = re.sub(
+        r"^(?:(?:mach|dreh)(?:e)?\s+)?(?:den\s+|die\s+|das\s+)?"
+        r"(?:computer|pc|windows|system)\s+(lauter|leiser)$",
+        _pc_volume_direction,
+        text,
+    )
+    text = re.sub(
+        r"^(?:stelle\s+)?(?:die\s+)?(?:"
+        r"system\s*(?:lautstärke|lautstaerke)|"
+        r"(?:computer|pc|windows|system)\s+(?:lautstärke|lautstaerke)"
+        r")\s+(?:auf\s+)?(\d{1,3})(?:\s*(?:prozent|%))?$",
+        r"system volume \1",
+        text,
+    )
+    text = re.sub(r"^(?:ton|sound|audio|lautstärke|lautstaerke)\s+(?:aus|stumm)$", "mute", text)
+    text = re.sub(r"^(?:ton|sound|audio)\s+(?:an|ein)$", "unmute", text)
+    text = re.sub(r"^stumm\s*schalt\w*$", "mute", text)
+    text = re.sub(r"^entstumm\w*$", "unmute", text)
+    text = re.sub(r"^(?:mach(?:e)?\s+)?(?:stumm|lautlos)$", "mute", text)
+    text = re.sub(r"^dreh(?:e)?\s+(?:es\s+)?(lauter|leiser)$", _pc_volume_direction, text)
+    text = re.sub(
+        r"^(?:dreh(?:e)?|mach(?:e)?)\s+(?:den\s+)?ton\s+(lauter|leiser)$",
+        _pc_volume_direction,
+        text,
+    )
+    return text
+
+
+def _apply_answer_rewrites(text: str) -> str:
+    """Map one clause onto a spoken answer, timer, or cancel."""
+    text = re.sub(
+        r"^(?:sag(?:en|e)?(?:\s+mir)?\s+)?(?:wie\s+sp[aä]t(?:\s+(?:ist\s+es|es\s+ist))?|"
+        r"wie\s*viel\s+uhr(?:\s+(?:ist\s+es|es\s+ist))?|uhrzeit)$",
+        "what time is it",
+        text,
+    )
+    text = re.sub(
+        r"^(?:wie\s+voll\s+ist\s+der\s+akku|wie\s+viel\s+akku|akku(?:stand)?|batterie(?:stand)?)$",
+        "battery",
+        text,
+    )
+    text = re.sub(
+        r"^(?:was\s+l[aä]uft(?:\s+gerade)?|was\s+laeuft(?:\s+gerade)?|"
+        r"welcher\s+(?:song|titel)|was\s+spielst\s+du(?:\s+gerade)?)$",
+        "whats playing",
+        text,
+    )
+    text = re.sub(
+        r"^(?:timer\s+(?:abbrechen|stoppen|aus)|(?:stopp(?:e)?|stoppe)\s+den\s+timer)$",
+        "cancel timer",
+        text,
+    )
+    text = re.sub(
+        r"^(?:stell(?:e)?\s+)?(?:einen\s+)?(?:timer|wecker)\s+(?:auf\s+|fuer\s+|für\s+)?(\d+)\s*"
+        r"(sekunden|sekunde|minuten|minute|stunden|stunde)$",
+        lambda m: (
+            f"timer {m.group(1)} "
+            + {
+                "sekunde": "seconds",
+                "sekunden": "seconds",
+                "minute": "minutes",
+                "minuten": "minutes",
+                "stunde": "hours",
+                "stunden": "hours",
+            }[m.group(2)]
+        ),
+        text,
+    )
+    return text
 
 
 def _rewrite_spoken_german(text: str) -> str:
@@ -497,6 +836,17 @@ def _rewrite_spoken_german(text: str) -> str:
     search text after the verb stay as spoken.
     """
     text = _DE_LEADING_FILLER.sub("", text)
+    text = _DE_INLINE_FILLER.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"(?:\s+(?:bitte|jetzt|danke))+$", "", text)
+
+    # Desktop and answer commands are recognized per clause, so
+    # "öffne Chrome und mach einen Screenshot" still sees the screenshot half
+    # on its own. Search compounds stay intact because their clauses are not rewritten.
+    clauses = [clause.strip() for clause in re.split(r"\s+(?:und|and)\s+", text) if clause.strip()]
+    text = " and ".join(
+        _apply_answer_rewrites(_apply_desktop_rewrites(clause)) for clause in clauses
+    )
 
     text = re.sub(
         r"\b(?:mach(?:e)?|nimm)\s+(?:bitte\s+)?(?:ein(?:en)?\s+)?(?:foto|photo|bild|selfie)\b",
@@ -525,6 +875,7 @@ def _rewrite_spoken_german(text: str) -> str:
         "quieter",
         text,
     )
+    text = re.sub(r"\b(louder|quieter)\s+machen\b", r"\1", text)
     text = re.sub(
         r"\b(?:stelle\s+)?(?:die\s+)?(?:lautstärke|lautstaerke)\s+(?:auf\s+)?(\d{1,3})"
         r"(?:\s*(?:prozent|percent|%))?",
@@ -552,6 +903,11 @@ def _rewrite_spoken_german(text: str) -> str:
     text = re.sub(
         r"\b(?:such(?:e)?|suchen)\s+(?:mal\s+)?(?:in|mit|auf|bei)\s+([a-z0-9]+)\s+nach\b",
         r"search \1 for",
+        text,
+    )
+    text = re.sub(
+        r"\b(?:such(?:e)?|finde)\s+(?:mir\s+)?(?:die\s+|eine\s+)?datei\s+",
+        "find file ",
         text,
     )
     text = re.sub(r"\b(?:such(?:e)?|suchen)\s+(?:mal\s+)?nach\b", "search for", text)
@@ -630,6 +986,25 @@ _ACTION_LABELS = {
     "spotify_volume_up": "[VOLUME UP]",
     "spotify_volume_down": "[VOLUME DOWN]",
     "spotify_shuffle": "[SHUFFLE {arg}]",
+    "system_volume": "[SYSTEM VOLUME {arg}]",
+    "system_volume_up": "[SYSTEM VOLUME UP]",
+    "system_volume_down": "[SYSTEM VOLUME DOWN]",
+    "system_mute": "[MUTED]",
+    "system_unmute": "[UNMUTED]",
+    "screenshot": "[SCREENSHOT]",
+    "window_minimize": "[MINIMIZED]",
+    "window_maximize": "[MAXIMIZED]",
+    "window_restore": "[RESTORED]",
+    "window_left": "[WINDOW LEFT]",
+    "window_right": "[WINDOW RIGHT]",
+    "answer_time": "[TIME]",
+    "answer_battery": "[BATTERY]",
+    "answer_now_playing": "[NOW PLAYING]",
+    "timer_set": "[TIMER {arg}]",
+    "timer_cancel": "[TIMER CANCELLED]",
+    "focus_window": "[FOCUS {arg}]",
+    "open_folder": "[FOLDER {arg}]",
+    "find_file": "[FILE {arg}]",
 }
 
 
@@ -642,7 +1017,25 @@ _CONJUNCTION_SPLIT = re.compile(r"\s+(?:and|plus|also|then)\s+", re.IGNORECASE)
 _APP_VERB = re.compile(rf"\b({_OPEN_TRIGGER}|{_CLOSE_TRIGGER})\s+", re.IGNORECASE)
 _STARTS_WITH_APP_VERB = re.compile(rf"^(?:{_OPEN_TRIGGER}|{_CLOSE_TRIGGER})\s+", re.IGNORECASE)
 _STARTS_WITH_OTHER_VERB = re.compile(
-    rf"^(?:{_SEARCH_VERB}|write|take|navigate|go|play|pause|stop|resume|skip|next|previous|volume|shuffle)\b",
+    rf"^(?:{_SEARCH_VERB}|write|take|navigate|go|play|pause|stop|resume|skip|next|previous|volume|shuffle|"
+    rf"mute|unmute|minimize|minimise|maximize|maximise|restore|snap|screenshot|system|"
+    rf"switch|focus|show|find|timer|cancel|battery|what)\b",
+    re.IGNORECASE,
+)
+# A finished command after "and" is its own action. "open chrome and search
+# for cats" does not match, so that phrase stays whole and keeps the browser.
+_STANDALONE_COMMAND = re.compile(
+    r"^(?:"
+    r"take a (?:screenshot|photo)|"
+    r"minimize|maximize|restore|"
+    r"snap (?:left|right)|"
+    r"mute|unmute|"
+    r"system volume (?:up|down|\d{1,3})|"
+    r"(?:pause|stop|next|previous|play)|"
+    r"what time is it|whats playing|battery|cancel timer|"
+    r"timer \d+ (?:seconds|minutes|hours)|"
+    r"switch to .+|focus .+|show .+|find file .+"
+    r")$",
     re.IGNORECASE,
 )
 
@@ -668,6 +1061,9 @@ def _expand_conjunctions(text: str) -> list[str]:
         if _STARTS_WITH_APP_VERB.match(part):
             out.append(part)
             verb = _APP_VERB.search(part).group(1)
+        elif _STANDALONE_COMMAND.match(part):
+            out.append(part)
+            verb = None
         elif verb and not _STARTS_WITH_OTHER_VERB.match(part):
             out.append(f"{verb} {part}")
         else:
@@ -725,13 +1121,31 @@ class LLMFallbackClassifier:
         '{"action": "spotify_pause"} or '
         '{"action": "spotify_resume"} or '
         '{"action": "spotify_next"} or '
-        '{"action": "spotify_previous"}. '
-        "The speaker may use German or English. Keep search queries, dictated "
-        "text, and song titles in the original wording. German app names: "
-        "Rechner/Taschenrechner=calculator, Kamera=camera, Dateien=explorer, "
-        "Konsole=terminal, Notizblock=notepad. "
-        "Only classify a command if the intent is unambiguous and imperative. "
-        "If the fragment is incomplete or unclear, respond {\"action\": null}."
+        '{"action": "spotify_previous"} or '
+        '{"action": "system_volume", "percent": 40} or '
+        '{"action": "system_volume", "direction": "up"} or '
+        '{"action": "system_volume", "direction": "down"} or '
+        '{"action": "system_mute", "muted": true} or '
+        '{"action": "screenshot"} or '
+        '{"action": "window", "op": "minimize"} or '
+        '{"action": "answer_time"} or '
+        '{"action": "answer_battery"} or '
+        '{"action": "answer_now_playing"} or '
+        '{"action": "timer", "seconds": 300} or '
+        '{"action": "timer_cancel"} or '
+        '{"action": "focus_window", "app": "<name>"} or '
+        '{"action": "open_folder", "folder": "downloads"} or '
+        '{"action": "find_file", "query": "<file name>"}. '
+        "window op is one of minimize, maximize, restore, left, right. "
+        "system_volume and system_mute are the PC, not Spotify. "
+        "Bare volume/louder/lauter without computer, system, pc, or windows stays Spotify. "
+        "The speaker may use German or English, including casual paraphrases. "
+        "Keep search queries, dictated text, and song titles in the original wording. "
+        "German app names: Rechner/Taschenrechner=calculator, Kamera=camera, "
+        "Dateien=explorer, Konsole=terminal, Notizblock=notepad. "
+        "When the user is telling you to do something this schema can do, pick that "
+        "action. Respond {\"action\": null} only when there is no request, the "
+        "utterance is only a wake word, or it is small talk."
     )
 
     def __init__(self) -> None:
@@ -752,7 +1166,7 @@ class LLMFallbackClassifier:
         if not self.enabled():
             return None
         try:
-            raw = self._call_llm(text, self.SYSTEM_PROMPT)
+            raw = self._call_llm(text, self.SYSTEM_PROMPT, timeout=8)
             raw = raw.strip()
             if raw.startswith("```"):
                 raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -847,12 +1261,107 @@ class LLMFallbackClassifier:
             return Action("spotify_next", "spotify_next", sp.next_track)
         if action == "spotify_previous":
             return Action("spotify_previous", "spotify_previous", sp.previous_track)
+        if action == "system_volume":
+            percent = data.get("percent")
+            if percent is not None and str(percent).strip() != "":
+                try:
+                    level = _clamp_spoken_percent(str(percent).strip())
+                except ValueError:
+                    return None
+                return Action(
+                    "system_volume",
+                    f"system_volume:{level}",
+                    lambda: wa.set_system_volume(level),
+                    display_arg=f"{level}%",
+                )
+            direction = str(data.get("direction", "")).lower()
+            if direction in ("up", "down"):
+                return _system_volume_step(direction == "up")
+            return None
+        if action == "system_mute":
+            muted = data.get("muted", True)
+            if isinstance(muted, str):
+                muted = muted.strip().lower() not in ("false", "0", "no", "off")
+            return _system_mute_action(bool(muted))
+        if action == "screenshot":
+            return Action("screenshot", "screenshot", wa.take_screenshot)
+        if action == "window":
+            op = str(data.get("op", "")).lower()
+            windows = {
+                "minimize": ("window_minimize", wa.minimize_window),
+                "maximize": ("window_maximize", wa.maximize_window),
+                "restore": ("window_restore", wa.restore_window),
+                "left": ("window_left", lambda: wa.snap_window("left")),
+                "right": ("window_right", lambda: wa.snap_window("right")),
+            }
+            chosen = windows.get(op)
+            if chosen is None:
+                return None
+            name, run = chosen
+            return Action(name, name, run)
+        if action == "answer_time":
+            return Action("answer_time", "answer_time", answers.tell_time)
+        if action == "answer_battery":
+            return Action("answer_battery", "answer_battery", answers.tell_battery)
+        if action == "answer_now_playing":
+            return Action("answer_now_playing", "answer_now_playing", answers.tell_now_playing)
+        if action == "timer":
+            try:
+                seconds = max(1, int(data.get("seconds", 0)))
+            except (TypeError, ValueError):
+                return None
+            return Action("timer_set", f"timer_set:{seconds}", lambda: answers.start_timer(seconds), display_arg=f"{seconds}s")
+        if action == "timer_cancel":
+            return Action("timer_cancel", "timer_cancel", answers.cancel_timer)
+        if action == "focus_window":
+            app = str(data.get("app", "")).strip()
+            if not app:
+                return None
+            return Action("focus_window", f"focus_window:{app.lower()}", lambda: wa.focus_window(app), display_arg=app)
+        if action == "open_folder":
+            folder = str(data.get("folder", "")).strip()
+            if not folder:
+                return None
+            return Action(
+                "open_folder", f"open_folder:{folder.lower()}", lambda: wa.open_folder(folder), display_arg=folder
+            )
+        if action == "find_file":
+            query = str(data.get("query", "")).strip()
+            if not query:
+                return None
+            return Action("find_file", f"find_file:{query.lower()}", lambda: wa.find_file(query), display_arg=query)
         return None
+
+
+def _worth_asking_llm(text: str) -> bool:
+    """False for a bare wake word or acknowledgement — nothing to execute."""
+    cleaned = re.sub(r"[^a-zäöüß0-9\s]", "", text.lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned not in {
+        "",
+        "please",
+        "now",
+        "thanks",
+        "thank you",
+        "okay",
+        "ok",
+        "jarvis",
+        "hey jarvis",
+        "hallo",
+        "hey",
+        "hallo jarvis",
+        "danke",
+        "ja",
+        "nein",
+        "yes",
+        "no",
+    }
 
 
 class IntentEngine:
     def __init__(self, on_action_started: ActionCallback, use_llm_fallback: bool = True) -> None:
         self._on_action_started = on_action_started
+        answers.set_done_callback(lambda: self._on_action_started(answers.timer_done_label()))
         self._fired: dict[int, set[str]] = {}
         self._executor = ThreadPoolExecutor(max_workers=2)
         self._llm = LLMFallbackClassifier() if use_llm_fallback else None
@@ -871,9 +1380,31 @@ class IntentEngine:
         # everywhere except write_in_app's dictated content, handled below.
         normalized = _normalize_transcript(text)
 
+        if speech_final:
+            commands = macros.match(normalized)
+            if commands:
+                self._mark_fired(utterance_id, f"macro:{normalized}")
+                print(f"[intent] macro {normalized!r} -> {commands}")
+                for command in commands:
+                    for part in _expand_conjunctions(_normalize_transcript(command)):
+                        self._handle_command(part, command, True, True, utterance_id)
+                self._fired.pop(utterance_id, None)
+                return
+
         # "open spotify and chrome" -> two commands, each handled on its own.
         for command in _expand_conjunctions(normalized):
             self._handle_command(command, text, is_final, speech_final, utterance_id)
+
+        # Regex missed the whole utterance. Ask the LLM with the original
+        # wording — the rewritten text is for the patterns, and a half-rewritten
+        # clause ("mal louder machen") is harder to classify than what was said.
+        if speech_final and not self._fired.get(utterance_id) and _worth_asking_llm(text):
+            if self._llm is not None:
+                action = self._llm.classify(text.strip())
+                if action is not None:
+                    self._fire(action, text, speech_final, utterance_id)
+            if not self._fired.get(utterance_id):
+                print(f"[intent] unmatched: {text.strip()!r}")
 
         if speech_final:
             self._fired.pop(utterance_id, None)
@@ -892,23 +1423,6 @@ class IntentEngine:
                 break
             if not self._fire(action, original_text, speech_final, utterance_id):
                 break
-        else:
-            return
-        if self._fired.get(utterance_id):
-            return  # regex already found something for this utterance - no LLM pass
-        # Only on a finished utterance. Calling Gemini on every growing
-        # partial (seen live: 8x "play attack on titan opening" while music
-        # kept the mic above the silence threshold) burned the quota (429)
-        # and never fired until the final anyway - spotify_play is final-only.
-        if (
-            self._llm is not None
-            and speech_final
-            and normalized
-            and normalized not in {"please", "now", "thanks", "thank you", "okay", "ok"}
-        ):
-            action = self._llm.classify(normalized)
-            if action is not None:
-                self._fire(action, original_text, speech_final, utterance_id)
 
     def _fire(self, action: Action, original_text: str, speech_final: bool, utterance_id: int) -> bool:
         """Executes `action` unless it's deferred/deduped. Returns True if it
@@ -959,4 +1473,5 @@ class IntentEngine:
         # worker thread finishing an action (and emitting a Qt signal) can
         # race the interpreter's native cleanup and crash the process. Call
         # this before app.quit(), not after.
+        answers.cancel_timer()
         self._executor.shutdown(wait=wait)
